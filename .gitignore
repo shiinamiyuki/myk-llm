@@ -1,0 +1,11 @@
+**/__pycache__
+_download_models/
+data/
+*.egg-info/
+.cache
+checkpoints/
+
+
+summary.txt
+train.sh
+tokenize.sh
