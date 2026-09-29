@@ -14,6 +14,7 @@ VARIANTS = {
     "qknorm_gate_rope_all": {"attention.qk_norm": "true", "attention.output_gate": "true", "attention.global_rope": "all"},
     "deltanet": {"layer_pattern": "GD"},
     "ngram": {"ngram.orders": "[2, 3]", "ngram.num_buckets": "1024", "ngram.dim": "32"},
+    "ngram_mid_layers": {"ngram.orders": "[2]", "ngram.num_buckets": "1024", "ngram.dim": "128", "ngram.layers": "[0, 2]"},
     "residual_input": {"residual.gate": "input"},
     "residual_channel": {"residual.gate": "channel"},
     "mtp": {"mtp.depth": "2"},
@@ -54,7 +55,7 @@ def test_incremental_decoding_matches_full_forward(name):
 @torch.no_grad()
 def test_document_masking_isolates_documents(name):
     """A packed row with document masking == each document run on its own."""
-    if name == "ngram":
+    if name.startswith("ngram"):
         pytest.skip("n-grams read across document seams by design")
     model = build(**VARIANTS[name])
     ids = torch.randint(0, 500, (1, 256), device="cuda")
@@ -107,3 +108,23 @@ def test_training_step_produces_finite_gradients(name):
     assert torch.isfinite(out.loss)
     for param_name, param in model.named_parameters():
         assert param.grad is not None and torch.isfinite(param.grad).all(), param_name
+
+
+def test_ngram_layers_must_be_valid_block_indices():
+    with pytest.raises(ValueError):
+        tiny_model_config(**{"ngram.orders": "[2]", "ngram.layers": "[4]"})  # num_layers is 4
+
+
+def test_ngram_update_reaches_only_its_layer():
+    """With layers=[2], the n-gram update enters the residual stream at block 2, so the
+    outputs of blocks 0 and 1 do not depend on it."""
+    model = build(**{"ngram.orders": "[2]", "ngram.num_buckets": "64", "ngram.dim": "32", "ngram.layers": "[2]"})
+    ids = torch.randint(0, 500, (1, 32), device="cuda")
+    seen = []
+    hook = model.layers[1].register_forward_hook(lambda _m, _i, out: seen.append(out[0].detach().clone()))
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        model(ids)
+        model.embed.ngram.projs[0].weight.mul_(10)
+        model(ids)
+    hook.remove()
+    torch.testing.assert_close(seen[0], seen[1])

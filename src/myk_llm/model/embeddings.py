@@ -35,24 +35,34 @@ class NgramEmbedding(nn.Module):
         self.num_buckets = config.num_buckets
         self.sentinel = vocab_size  # stands in for "no token" left of the sequence start
         self.tables = nn.ModuleList(nn.Embedding(config.num_buckets, config.dim) for _ in self.orders)
-        self.proj = nn.Linear(config.dim, hidden_size, bias=False) if config.dim != hidden_size else None
+        self.layers = list(config.layers)
+        needs_proj = config.dim != hidden_size or self.layers != [0]
+        # projs[k] feeds block layers[k]; keyed by position so parameter names are stable.
+        self.projs = nn.ModuleList(
+            nn.Linear(config.dim, hidden_size, bias=False) if needs_proj else nn.Identity() for _ in self.layers
+        )
 
     @property
     def context(self) -> int:
         return max(self.orders) - 1
 
-    def forward(self, input_ids: torch.Tensor, prefix_ids: torch.Tensor | None) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, prefix_ids: torch.Tensor | None) -> dict[int, torch.Tensor]:
+        """{block index: (batch, seq_len, hidden) update to add to that block's input}."""
+        features = self.lookup(input_ids, prefix_ids)
+        return {layer: proj(features) for layer, proj in zip(self.layers, self.projs)}
+
+    def lookup(self, input_ids: torch.Tensor, prefix_ids: torch.Tensor | None) -> torch.Tensor:
+        """Summed table rows, (batch, seq_len, dim)."""
         batch, context = input_ids.size(0), self.context
         left = torch.full((batch, context), self.sentinel, dtype=input_ids.dtype, device=input_ids.device)
         if prefix_ids is not None and prefix_ids.size(1) > 0:
             tail = prefix_ids[:, -context:]
             left[:, context - tail.size(1) :] = tail
         tokens = torch.cat([left, input_ids], dim=1)
-        out = sum(
+        return sum(
             table(ngram_bucket_ids(tokens, order, context, self.num_buckets))
             for order, table in zip(self.orders, self.tables)
         )
-        return self.proj(out) if self.proj is not None else out
 
 
 class Embeddings(nn.Module):
@@ -68,8 +78,9 @@ class Embeddings(nn.Module):
         """How many preceding tokens the embedding looks at (needed during decoding)."""
         return self.ngram.context if self.ngram is not None else 0
 
-    def forward(self, input_ids: torch.Tensor, prefix_ids: torch.Tensor | None = None) -> torch.Tensor:
-        x = self.token(input_ids)
-        if self.ngram is not None:
-            x = x + self.ngram(input_ids, prefix_ids)
-        return x
+    def forward(
+        self, input_ids: torch.Tensor, prefix_ids: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        """Token embeddings, plus the n-gram updates keyed by the block they feed."""
+        updates = self.ngram(input_ids, prefix_ids) if self.ngram is not None else {}
+        return self.token(input_ids), updates

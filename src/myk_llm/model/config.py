@@ -63,16 +63,21 @@ class ResidualConfig:
 
 @dataclass
 class NgramEmbeddingConfig:
-    """Hashed n-gram input embeddings added to the token embedding.
+    """Hashed n-gram embeddings added to the residual stream.
 
     For each order n, the n tokens ending at position i are hashed into one of
     `num_buckets` rows of a dedicated table (input side only; the output vocab is
-    unchanged). `dim` < hidden_size stores a narrower table plus a projection.
+    unchanged). The tables are looked up once; each layer listed in `layers` gets its
+    own projection dim -> hidden_size, added to that block's input (layer 0 = on top of
+    the token embedding; a middle layer lets the model combine the n-gram lookup with
+    context it has already built). With the single layer 0 and dim == hidden_size
+    there is no projection.
     """
 
     orders: list[int] = field(default_factory=list)  # e.g. [2, 3]; empty disables
     num_buckets: int = 131_072
     dim: int = 256
+    layers: list[int] = field(default_factory=lambda: [0])  # block indices to inject into
 
 
 @dataclass
@@ -110,6 +115,10 @@ class ModelConfig:
             raise ValueError("attention.num_heads must be divisible by attention.num_kv_heads")
         if any(order < 2 for order in self.ngram.orders):
             raise ValueError("ngram.orders must be >= 2 (order 1 is the token embedding)")
+        if self.ngram.orders:
+            layers = self.ngram.layers
+            if not layers or len(set(layers)) != len(layers) or not all(0 <= i < self.num_layers for i in layers):
+                raise ValueError(f"ngram.layers must be distinct block indices in [0, {self.num_layers}), got {layers}")
         if self.mtp.layer not in LAYER_CODES:
             raise ValueError(f"mtp.layer must be one of {LAYER_CODES}")
 

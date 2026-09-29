@@ -185,10 +185,12 @@ class MykLLM(nn.Module):
             if use_cache:
                 raise ValueError("document masking (seqlens) cannot be combined with a cache")
             varlen = build_varlen(seqlens, batch, seq_len, input_ids.device)
-        x = self.embed(input_ids, prefix_ids)
+        x, ngram_updates = self.embed(input_ids, prefix_ids)
         states = cache if cache is not None else [None] * len(self.layers)
         new_cache: list[Any] | None = [] if use_cache else None
-        for block, state in zip(self.layers, states):
+        for index, (block, state) in enumerate(zip(self.layers, states)):
+            if index in ngram_updates:
+                x = x + ngram_updates[index]
             x, state = block(x, position_ids, varlen, state, use_cache)
             if new_cache is not None:
                 new_cache.append(state)

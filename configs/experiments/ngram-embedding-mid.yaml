@@ -1,0 +1,8 @@
+# Hashed 2-/3-gram embeddings injected into a middle layer (block 4 of 9) instead of
+# the input, so the lookup meets a residual stream that already carries context.
+# Compare with ngram-embedding.yaml (input only); list several layers, e.g. [0, 4],
+# to inject at both (tables shared, one projection per layer).
+base: ngram-embedding.yaml
+run_name: ablation-ngram-embedding-mid
+model:
+  ngram: {layers: [4]}
