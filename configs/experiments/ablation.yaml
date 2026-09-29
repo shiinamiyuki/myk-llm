@@ -1,0 +1,16 @@
+# Shared recipe for architecture ablations: the 200M model on ~2.1B tokens
+# (256 seqs x 2048 x 4000 steps), constant schedule with a short final decay so runs
+# can be compared at the end. Each experiment file only states what it changes;
+# compare runs by val bits-per-byte (val/*/bpb), which is tokenizer-independent.
+base: [../pretrain/base.yaml, ../model/200m.yaml]
+run_name: ablation-baseline
+steps: 4000
+schedule:
+  kind: wsd
+  decay_ratio: 0.2
+checkpoint:
+  interval: 2000
+  keep_last: 1
+eval:
+  interval: 250
+  sample_interval: 0

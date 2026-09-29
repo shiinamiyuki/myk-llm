@@ -1,0 +1,39 @@
+# Shared pretraining settings: bilingual (English + Chinese) edu-web shards, Muon,
+# warmup-stable-decay schedule, Qwen embedding warm start. Build the shards with
+# scripts/pretokenize.py (see notes/training-pipeline.md).
+output_dir: runs
+global_batch_size: 256        # sequences per optimizer step, across all GPUs
+data:
+  kind: shards
+  tokenizer: _download_models/Qwen3.5-0.8B-pruned64k
+  seq_len: 2048
+  micro_batch_size: 16          # per GPU; gradient accumulation fills global_batch_size
+  document_masking: true
+  sources:
+    - {name: en, weight: 0.4, path: data/shards/fineweb-edu-en/train}
+    - {name: zh, weight: 0.6, path: data/shards/fineweb-edu-zh/train}
+optimizer:
+  name: muon
+  lr: 5.0e-4
+  weight_decay: 0.1
+schedule:
+  kind: wsd
+  warmup_ratio: 0.01
+  decay_ratio: 0.2
+init:
+  embedding_from: _download_models/Qwen3.5-0.8B
+  embedding_row_map: _download_models/Qwen3.5-0.8B-pruned64k/embedding_row_map.npy
+checkpoint:
+  interval: 1000
+  keep_last: 3
+  keep_every: 10000
+eval:
+  interval: 500
+  batches: 8
+  val_sets:
+    - {name: en, sources: [{name: en, path: data/shards/fineweb-edu-en/val}]}
+    - {name: zh, sources: [{name: zh, path: data/shards/fineweb-edu-zh/val}]}
+  sample_interval: 2000
+  sample_prompts: ["The meaning of life is", "中国的首都是"]
+logging:
+  interval: 10

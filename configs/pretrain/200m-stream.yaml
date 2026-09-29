@@ -1,0 +1,14 @@
+# Same run, streaming the corpora from HuggingFace instead of pre-tokenized shards
+# (no preprocessing; needs network access for the whole run).
+base: 200m.yaml
+run_name: 200m-pt-stream
+data:
+  kind: stream
+  num_workers: 4
+  sources:
+    - {name: en, weight: 0.4, hf_path: HuggingFaceFW/fineweb-edu, hf_config: sample-100BT, script: latin}
+    - {name: zh, weight: 0.6, hf_path: opencsg/Fineweb-Edu-Chinese-V2.1, hf_data_dir: "4_5", script: cjk, curated: true}
+eval:
+  val_sets:
+    - {name: en, sources: [{name: en, hf_path: HuggingFaceFW/fineweb-edu, hf_config: sample-100BT, script: latin}]}
+    - {name: zh, sources: [{name: zh, hf_path: opencsg/Fineweb-Edu-Chinese-V2.1, hf_data_dir: "4_5", script: cjk, curated: true}]}

@@ -1,5 +1,7 @@
 # Training MykLLM — notes & plan
 
+> **Note (2026-09):** the code moved to the `myk_llm` package (`src/myk_llm/`); file and flag names below refer to the old `myk-llm/` scripts. See [pipeline.md](pipeline.md) for the current workflow.
+
 Target: ~0.6B-param LLM, Qwen3.5-0.8B tokenizer, trained on an RTX 5090 (32 GB).
 Goal: conversational ability, not deep world knowledge. Stretch goal: 64K context.
 

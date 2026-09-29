@@ -1,0 +1,7 @@
+# Linear-attention hybrid: Gated DeltaNet in place of sliding-window attention
+# (pattern G D: every other layer global softmax attention).
+base: ablation.yaml
+run_name: ablation-hybrid-deltanet
+model:
+  layer_pattern: GD
+  deltanet: {num_heads: 8, head_dim: 128, expand_v: 1.0}

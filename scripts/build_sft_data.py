@@ -2,13 +2,15 @@
 
 Pulls a few instruction-tuning sources chosen to fit a small (~200M) model — clean
 instruction-following, not reasoning-heavy — and normalizes every row to the
-`{"messages": [{"role", "content"}, ...]}` shape that `myk-llm/tokenization.py
---mode chat` consumes.
+`{"messages": [{"role", "content"}, ...]}` shape that `scripts/tokenize_sft.py`
+consumes.
 
 Default sources:
-  - HuggingFaceTB/smoltalk            (English, ablated for small models)
+  - HuggingFaceTB/smoltalk            (English; instruction subsets only — the
+                                       math/CoT/long-context subsets are dropped as
+                                       too hard for a ~200M model)
   - m-a-p/COIG-CQIA                   (Chinese, native high-quality instruction)
-  - BelleGroup/train_1M_CN           (Chinese, volume)
+  - opencsg/Fineweb-Edu-Chinese-V2.2 (Chinese, native synthetic QA, volume)
 
 Each source is streamed (no full local copy), capped at --max-per-source, converted,
 lightly filtered, and deduped. The union is shuffled with a fixed seed and split into
@@ -16,12 +18,11 @@ train/val JSONL. Weighting is by cap: raise the zh caps to match the ~0.4 en / 0
 pretrain ratio.
 
 Example:
-  python myk-llm/scripts/build_sft_data.py --out-dir data/sft \
+  python scripts/build_sft_data.py --out-dir data/sft \
       --max-per-source 200000 --val-frac 0.01
 
 Then:
-  python myk-llm/tokenization.py --mode chat \
-      --tokenizer _download_models/Qwen3.5-0.8B-pruned64k \
+  python scripts/tokenize_sft.py --tokenizer _download_models/Qwen3.5-0.8B-pruned64k \
       --data data/sft/train.jsonl --output data/sft/train
 """
 from __future__ import annotations
@@ -36,7 +37,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 os.environ.setdefault(
-    "HF_HOME", str(Path(__file__).resolve().parents[2] / ".cache" / "hf")
+    "HF_HOME", str(Path(__file__).resolve().parents[1] / ".cache" / "hf")
 )
 
 # ShareGPT-style role aliases; keep in sync with tokenization.normalize_chat_messages.
@@ -60,10 +61,29 @@ class Source:
     configs: list[str | None] = field(default_factory=lambda: [None])
     split: str = "train"
     cap: int | None = None  # per-source override of --max-per-source
+    # Per-source cap on total assistant-turn characters. Used to keep sources whose
+    # answers are long/essay-like (e.g. the synthetic Fineweb-Edu-Chinese QA) from
+    # teaching a ~200M model a verbose register it can't sustain. None = no extra cap.
+    max_assistant_chars: int | None = None
 
 
 DEFAULT_SOURCES: list[Source] = [
-    Source("smoltalk", "HuggingFaceTB/smoltalk", "en", configs=["all"]),
+    # smoltalk ships as per-task subsets plus an "all" superset. We enumerate the
+    # clean instruction-following subsets and deliberately OMIT the ones a ~200M model
+    # can't learn from: metamathqa-50k + numina-cot-100k (multi-step math CoT it only
+    # learns to fake), longalign (>seq_len), apigen-80k (tool-call JSON) and
+    # self-oss-instruct (Python). Enumerating also avoids the "all"-superset trap where
+    # a --max-per-source cap silently takes only the first shard's subset.
+    Source(
+        "smoltalk",
+        "HuggingFaceTB/smoltalk",
+        "en",
+        configs=[
+            "smol-magpie-ultra", "smol-summarize", "smol-rewrite", "smol-constraints",
+            "everyday-conversations", "systemchats-30k", "openhermes-100k",
+            "explore-instruct-rewriting",
+        ],
+    ),
     # COIG-CQIA ships as many task subsets; pull a broad, clean spread. Unknown/failed
     # configs are skipped with a warning so the script survives schema drift.
     Source(
@@ -75,7 +95,19 @@ DEFAULT_SOURCES: list[Source] = [
             "wiki", "wikihow", "zhihu", "xhs", "douban", "finance", "segmentfault",
         ],
     ),
-    Source("belle", "BelleGroup/train_1M_CN", "zh", configs=[None]),
+    # Native synthetic Chinese QA (DeepSeek-V3.2, grounded in top-0.1% edu web text).
+    # Replaces the noisy machine-translated Belle. Answers are long/structured, so we
+    # cap assistant length to keep the verbose register from swamping COIG-CQIA's
+    # shorter, more varied instructions. `default`/`sft_qa` is the pure instruction-
+    # output split (sft/cleaned/*.jsonl); Alpaca instruction/input/output shape.
+    Source(
+        "finewebedu-zh",
+        "opencsg/Fineweb-Edu-Chinese-V2.2",
+        "zh",
+        configs=["default"],
+        split="sft_qa",
+        max_assistant_chars=1200,
+    ),
 ]
 
 
@@ -118,9 +150,17 @@ def row_to_messages(row: dict[str, Any]) -> list[dict[str, str]] | None:
     return messages
 
 
-def _passes_filters(messages: list[dict[str, str]], min_chars: int, max_chars: int) -> bool:
+def _passes_filters(
+    messages: list[dict[str, str]],
+    min_chars: int,
+    max_chars: int,
+    max_assistant_chars: int | None = None,
+) -> bool:
     total = sum(len(m["content"]) for m in messages)
     if total < min_chars or total > max_chars:
+        return False
+    assistant_chars = sum(len(m["content"]) for m in messages if m["role"] == "assistant")
+    if max_assistant_chars is not None and assistant_chars > max_assistant_chars:
         return False
     # Drop turns that are empty after normalization (already stripped) or degenerate.
     for m in messages:
@@ -150,7 +190,9 @@ def stream_source(source: Source, cap: int, min_chars: int, max_chars: int) -> I
             if produced >= cap:
                 break
             messages = row_to_messages(dict(row))
-            if messages is None or not _passes_filters(messages, min_chars, max_chars):
+            if messages is None or not _passes_filters(
+                messages, min_chars, max_chars, source.max_assistant_chars
+            ):
                 continue
             produced += 1
             yield messages

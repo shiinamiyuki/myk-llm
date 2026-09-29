@@ -1,0 +1,5 @@
+# Attention variant: QK-norm + sigmoid output gate on every attention layer.
+base: ablation.yaml
+run_name: ablation-attn-qknorm-gate
+model:
+  attention: {qk_norm: true, output_gate: true}

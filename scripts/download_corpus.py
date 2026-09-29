@@ -29,7 +29,7 @@ from datasets import load_dataset
 from tokenizers import Tokenizer
 
 
-DEFAULT_TOKENIZER = "/home/miyuki/repos/myk-llm/_download_models/Qwen3.5-0.8B/tokenizer.json"
+DEFAULT_TOKENIZER = "_download_models/Qwen3.5-0.8B/tokenizer.json"
 
 PRESETS: dict[str, dict[str, str]] = {
     "en": {"path": "HuggingFaceFW/fineweb-edu", "config": "sample-10BT", "text_key": "text"},

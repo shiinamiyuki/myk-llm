@@ -1,0 +1,5 @@
+# ~570M params: 33 layers, one global layer every 4 (see notes/throughput.md).
+base: 200m.yaml
+model:
+  num_layers: 33
+  layer_pattern: GLLL

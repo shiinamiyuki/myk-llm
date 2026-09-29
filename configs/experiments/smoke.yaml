@@ -1,0 +1,25 @@
+# Tiny end-to-end check of the pipeline (a couple of minutes on one GPU). Build its data:
+#   python scripts/pretokenize.py --preset en --target-tokens 3e7 --val-docs 400 --output data/shards-smoke/fineweb-edu-en --workers 4
+#   python scripts/pretokenize.py --preset zh --target-tokens 3e7 --val-docs 400 --output data/shards-smoke/fineweb-edu-zh --workers 4
+base: ablation.yaml
+run_name: smoke
+steps: 40
+global_batch_size: 16
+data:
+  seq_len: 1024
+  micro_batch_size: 8
+  sources:
+    - {name: en, weight: 0.4, path: data/shards-smoke/fineweb-edu-en/train}
+    - {name: zh, weight: 0.6, path: data/shards-smoke/fineweb-edu-zh/train}
+model:
+  num_layers: 3
+checkpoint: {interval: 20, keep_last: 2, keep_every: 0}
+eval:
+  interval: 20
+  batches: 2
+  val_sets:
+    - {name: en, sources: [{name: en, path: data/shards-smoke/fineweb-edu-en/val}]}
+    - {name: zh, sources: [{name: zh, path: data/shards-smoke/fineweb-edu-zh/val}]}
+  sample_interval: 40
+  sample_tokens: 16
+logging: {interval: 5}

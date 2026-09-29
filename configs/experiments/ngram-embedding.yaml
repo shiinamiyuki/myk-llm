@@ -1,0 +1,6 @@
+# Hashed 2-gram + 3-gram input embeddings (2 x 131072 x 256 tables + projection, ~67M
+# extra embedding params; almost no extra compute).
+base: ablation.yaml
+run_name: ablation-ngram-embedding
+model:
+  ngram: {orders: [2, 3], num_buckets: 131072, dim: 256}

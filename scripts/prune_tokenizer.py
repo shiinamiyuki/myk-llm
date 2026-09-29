@@ -245,6 +245,7 @@ def main() -> None:
     parser.add_argument("--target-vocab", type=int, default=65536, help="total rows incl. special tokens")
     parser.add_argument("--batch-lines", type=int, default=10000)
     parser.add_argument("--max-bytes-per-corpus", type=int, default=0, help="0 = read the whole file")
+    parser.add_argument("--chat-template", type=str, default=str(Path(__file__).resolve().parents[1] / "assets" / "chatml_no_think.jinja"))
     args = parser.parse_args()
 
     source = Path(args.source)
@@ -318,9 +319,11 @@ def main() -> None:
         str(entry["id"]): {k: v for k, v in entry.items() if k != "id"} for entry in new_added_tokens
     }
     (output / "tokenizer_config.json").write_text(json.dumps(tokenizer_config, ensure_ascii=False, indent=2), encoding="utf-8")
-    for aux in ("chat_template.jinja", "special_tokens_map.json"):
-        if (source / aux).exists():
-            shutil.copy(source / aux, output / aux)
+    if (source / "special_tokens_map.json").exists():
+        shutil.copy(source / "special_tokens_map.json", output / "special_tokens_map.json")
+    # Our ChatML template (no thinking block, {% generation %} tags for SFT loss masks),
+    # not Qwen's original one.
+    shutil.copy(args.chat_template, output / "chat_template.jinja")
 
     np.save(output / "embedding_row_map.npy", row_map)
     report = build_report(base_vocab, keep, u2b)

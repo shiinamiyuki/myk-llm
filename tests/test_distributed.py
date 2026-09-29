@@ -1,0 +1,59 @@
+"""Multi-process checks on CPU (gloo), so they run without multiple GPUs."""
+
+import os
+import socket
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn as nn
+
+from myk_llm.train.optim import Muon
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _reference_state(seed: int) -> dict[str, torch.Tensor]:
+    torch.manual_seed(seed)
+    model = nn.Sequential(nn.Linear(24, 40, bias=False), nn.Linear(40, 16, bias=False))
+    optimizer = Muon(model.parameters(), lr=0.02, weight_decay=0.1)
+    for step in range(3):
+        torch.manual_seed(100 + step)
+        model(torch.randn(8, 24)).square().mean().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+    return {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+
+def _sharded_worker(rank: int, world_size: int, port: int, out_path: str) -> None:
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(24, 40, bias=False), nn.Linear(40, 16, bias=False))
+    fully_shard(model, mesh=init_device_mesh("cpu", (world_size,)))
+    optimizer = Muon(model.parameters(), lr=0.02, weight_decay=0.1)
+    for step in range(3):
+        torch.manual_seed(100 + step)  # same batch on every rank -> same averaged gradient
+        model(torch.randn(8, 24)).square().mean().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+    full = {k: v.full_tensor().clone() for k, v in model.state_dict().items()}
+    if rank == 0:
+        torch.save(full, out_path)
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def test_muon_on_fsdp_shards_matches_unsharded(tmp_path):
+    out_path = str(tmp_path / "sharded.pt")
+    mp.spawn(_sharded_worker, args=(2, _free_port(), out_path), nprocs=2, join=True)
+    sharded = torch.load(out_path)
+    for name, expected in _reference_state(0).items():
+        torch.testing.assert_close(sharded[name], expected, rtol=1e-4, atol=1e-5)

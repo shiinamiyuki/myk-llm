@@ -14,8 +14,8 @@ comparable to published ones:
     64K-vocab MykLLM and a 150K-vocab Qwen can be compared directly.
 
 Usage:
-  python myk-llm/eval_bench.py --checkpoint checkpoints/200M-full-pt-v5-seq8k/last.pt
-  python myk-llm/eval_bench.py --hf-model HuggingFaceTB/SmolLM2-135M --tasks hellaswag,arc_easy
+  python -m myk_llm.eval.bench --model runs/200m-pt/checkpoints/step_0016000
+  python -m myk_llm.eval.bench --hf-model HuggingFaceTB/SmolLM2-135M --tasks hellaswag,arc_easy
 Results are appended as one JSON line per model to --output (default eval_results.jsonl).
 """
 
@@ -114,24 +114,18 @@ class LogLikelihoodModel:
 
 
 class MykModel(LogLikelihoodModel):
-    def __init__(self, checkpoint_path: str, tokenizer_path: str = "", max_len: int = 2048) -> None:
-        from model import MykLLM, MykLLMConfig
+    def __init__(self, model_dir: str, max_len: int = 2048) -> None:
+        from ..model import load_model
 
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        config = MykLLMConfig(**checkpoint["model_config"])
-        self.model = MykLLM(config).to(self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.model.eval()
-        tokenizer_path = tokenizer_path or checkpoint.get("training_args", {}).get("tokenizer", "")
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        self.max_len = min(max_len, config.max_seq_len)
-        self.name = str(Path(checkpoint_path).parent.name) + "/" + Path(checkpoint_path).stem
+        self.model = load_model(model_dir, device=self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        self.max_len = min(max_len, self.model.config.max_seq_len)
+        self.name = "/".join(Path(model_dir).resolve().parts[-3:])
         self.num_params = self.model.num_parameters()
 
     def forward_logits(self, input_ids: torch.Tensor) -> torch.Tensor:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits, _, _ = self.model(input_ids)
-        return cast(torch.Tensor, logits)
+            return self.model.logits(self.model(input_ids).hidden)
 
 
 class HFModel(LogLikelihoodModel):
@@ -348,9 +342,8 @@ def run_tasks(model: LogLikelihoodModel, tasks: Iterable[str], limit: int | None
 def main() -> None:
     parser = argparse.ArgumentParser()
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--checkpoint", type=str, help="MykLLM .pt checkpoint")
+    source.add_argument("--model", type=str, help="exported MykLLM model directory")
     source.add_argument("--hf-model", type=str, help="HuggingFace causal LM id or path (reference)")
-    parser.add_argument("--tokenizer", type=str, default="", help="override the checkpoint's tokenizer path")
     parser.add_argument("--tasks", type=str, default=",".join(ALL_TASKS))
     parser.add_argument("--limit", type=int, default=None, help="cap examples per task (quick runs)")
     parser.add_argument("--max-len", type=int, default=2048)
@@ -359,8 +352,8 @@ def main() -> None:
 
     torch.set_float32_matmul_precision("high")
     model: LogLikelihoodModel
-    if args.checkpoint:
-        model = MykModel(args.checkpoint, args.tokenizer, args.max_len)
+    if args.model:
+        model = MykModel(args.model, args.max_len)
     else:
         model = HFModel(args.hf_model, args.max_len)
     print(f"model={model.name} params={model.num_params / 1e6:.1f}M")

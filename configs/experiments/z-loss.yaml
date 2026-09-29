@@ -1,0 +1,4 @@
+base: ablation.yaml
+run_name: ablation-z-loss
+objective:
+  z_loss: 1.0e-4

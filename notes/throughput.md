@@ -1,5 +1,7 @@
 # Training throughput — profiling notes
 
+> **Note (2026-09):** measured with the old `myk-llm/training.py`; the refactored trainer matches its throughput (200M, 32x2048: ~128K tok/s). Re-measure with `scripts/benchmark_throughput.py`.
+
 Session goal: optimize `myk-llm/training.py` throughput for the planned base
 run — **pruned 64K tokenizer** (`_download_models/Qwen3.5-0.8B-pruned64k`,
 `vocab=65536`), **seq_len=2048**. Profiled on the target hardware below.

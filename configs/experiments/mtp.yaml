@@ -1,0 +1,7 @@
+# Multi-token prediction: one extra module predicting token t+2 (weight 0.3).
+base: ablation.yaml
+run_name: ablation-mtp
+model:
+  mtp: {depth: 1}
+objective:
+  mtp_weight: 0.3

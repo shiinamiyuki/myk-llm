@@ -1,0 +1,11 @@
+# Logit distillation from Qwen3.5-0.8B (same tokenizer family): 0.5 CE + 0.5 KL.
+# The teacher sees whole packed windows (it cannot do document masking).
+base: ablation.yaml
+run_name: ablation-distill-qwen
+data:
+  micro_batch_size: 8           # the teacher forward needs memory
+objective:
+  distill:
+    teacher: _download_models/Qwen3.5-0.8B
+    row_map: _download_models/Qwen3.5-0.8B-pruned64k/embedding_row_map.npy
+    weight: 0.5

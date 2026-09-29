@@ -10,7 +10,7 @@ configs and reports cheap automatic signals, plus every generation for reading:
   - hit:      for prompts with a known answer, the reply contains it
 
 Usage:
-  python myk-llm/eval_chat.py --checkpoint checkpoints/200M-v5-sft/last.pt --output chat_eval.jsonl
+  python -m myk_llm.eval.chat_eval runs/200m-sft/checkpoints/step_0006000 --output chat_eval.jsonl
 """
 
 from __future__ import annotations
@@ -23,8 +23,10 @@ from pathlib import Path
 
 import torch
 
-from chat import build_model_from_checkpoint, build_prompt_ids, load_checkpoint_payload, resolve_tokenizer_path
 from transformers import AutoTokenizer
+
+from ..chat import build_prompt_ids, generate_reply
+from ..model import load_model
 
 
 @dataclass
@@ -69,7 +71,7 @@ CASES: list[ChatCase] = [
 DECODING = {
     "greedy": dict(temperature=0.0, top_k=None, repetition_penalty=1.0),
     "sample": dict(temperature=0.7, top_k=50, repetition_penalty=1.0),
-    "chat_py_default": dict(temperature=0.8, top_k=50, repetition_penalty=1.3),
+    "chat_default": dict(temperature=0.7, top_k=50, top_p=0.95, repetition_penalty=1.1),  # myk_llm.chat defaults
 }
 
 _CJK = re.compile(r"[一-鿿]")
@@ -96,23 +98,15 @@ def repeated_ngram_fraction(tokens: list[int], n: int = 4) -> float:
     return 0.0 if not grams else 1.0 - len(set(grams)) / len(grams)
 
 
-@torch.no_grad()
 def generate(model, tokenizer, history, user_text, max_tokens, seed, **decoding) -> tuple[str, list[int], bool]:
     torch.manual_seed(seed)
     prompt_ids = build_prompt_ids(model, tokenizer, history, user_text, raw=False)
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        output = model.generate(prompt_ids, max_new_tokens=max_tokens, eos_token_id=tokenizer.eos_token_id, **decoding)
-    new_ids = output[0, prompt_ids.size(1) :].tolist()
-    stopped = tokenizer.eos_token_id in new_ids
-    if stopped:
-        new_ids = new_ids[: new_ids.index(tokenizer.eos_token_id)]
-    return tokenizer.decode(new_ids, skip_special_tokens=False), new_ids, stopped
+    return generate_reply(model, tokenizer, prompt_ids, max_tokens, **decoding)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--tokenizer", type=str, default="")
+    parser.add_argument("model", help="exported model directory")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--decoding", type=str, default=",".join(DECODING))
     parser.add_argument("--seed", type=int, default=0)
@@ -120,10 +114,9 @@ def main() -> None:
     args = parser.parse_args()
 
     torch.set_float32_matmul_precision("high")
-    checkpoint = load_checkpoint_payload(args.checkpoint)
-    tokenizer = AutoTokenizer.from_pretrained(resolve_tokenizer_path(args, checkpoint))
-    model = build_model_from_checkpoint(checkpoint, torch.device("cuda"))
-    del checkpoint
+    model = load_model(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
 
     records = []
     for decoding_name in [name.strip() for name in args.decoding.split(",")]:
@@ -137,7 +130,7 @@ def main() -> None:
                 history.append((user_text, text))
             records.append(
                 {
-                    "checkpoint": args.checkpoint,
+                    "model": args.model,
                     "decoding": decoding_name,
                     "case": case_index,
                     "turns": case.turns,
@@ -146,7 +139,7 @@ def main() -> None:
                     "stop": stopped,
                     "rep4": repeated_ngram_fraction(ids),
                     "lang_ok": reply_language_ok(text, case.lang),
-                    "leak": "<|im_start|>" in text or bool(re.search(r"(^|\n)(user|assistant)\n", text)),
+                    "leak": im_start in ids or bool(re.search(r"(^|\n)(user|assistant)\n", text)),
                     "hit": (any(contains_answer(text, a) for a in case.answers) if case.answers else None),
                     "num_tokens": len(ids),
                 }

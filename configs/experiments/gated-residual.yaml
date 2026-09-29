@@ -1,0 +1,5 @@
+# Input-dependent gated residual: x + 2*sigmoid(W norm(x)) * f(norm(x)), starts as baseline.
+base: ablation.yaml
+run_name: ablation-gated-residual
+model:
+  residual: {gate: input}

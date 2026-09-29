@@ -1,0 +1,3 @@
+base: [base.yaml, ../model/200m.yaml]
+run_name: 200m-pt
+steps: 16000                    # 256 x 2048 x 16000 = 8.4B tokens

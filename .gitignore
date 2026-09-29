@@ -9,3 +9,6 @@ checkpoints/
 summary.txt
 train.sh
 tokenize.sh
+training-scripts/
+runs/
+.pytest_cache/

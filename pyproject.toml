@@ -4,16 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "myk-llm"
-version = "0.1.0"
-description = "Simple CUDA-only LLM training and inference project for learning."
+version = "0.2.0"
+description = "Small bilingual (English + Chinese) LLM: architecture experiments and multi-GPU training."
 requires-python = ">=3.12"
 dependencies = [
 	"numpy>=1.26",
 	"safetensors>=0.4",
-	"torch>=2.5",
+	"torch>=2.9",
 	"flash-attn>=2.6.0",
 	"transformers>=4.46",
+	"tokenizers>=0.20",
+	"datasets>=3.0",
+	"torchdata>=0.10",
+	"pyyaml>=6.0",
+	"tqdm",
 ]
 
-[tool.setuptools]
-py-modules = []
+[project.optional-dependencies]
+# Gated DeltaNet (linear attention) mixer layers.
+linear-attn = ["flash-linear-attention>=0.5"]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

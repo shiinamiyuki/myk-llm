@@ -1,0 +1,31 @@
+# Chat supervised fine-tuning (SFT) from a pretrained 200M model. Tokenize the chat data
+# with scripts/tokenize_sft.py first.
+base: ../model/200m.yaml
+run_name: 200m-sft
+output_dir: runs
+steps: 6000                     # ~1 epoch of data/sft/train (198M tokens / 32K tokens per step)
+global_batch_size: 16
+data:
+  kind: sft
+  tokenizer: _download_models/Qwen3.5-0.8B-pruned64k
+  seq_len: 2048
+  micro_batch_size: 16
+  sources: [{name: sft, path: data/sft/train}]
+optimizer:
+  name: muon
+  lr: 2.0e-5
+schedule:
+  kind: cosine
+  warmup_ratio: 0.03
+init:
+  weights_from: runs/200m-pt-8k/checkpoints/step_0004000
+checkpoint:
+  interval: 1000
+eval:
+  interval: 200
+  batches: 16
+  val_sets: [{name: sft, sources: [{name: sft, path: data/sft/val}]}]
+  sample_interval: 1000
+  sample_chat: true
+  sample_prompts: ["用中文解释一下什么是梯度下降。", "Give me three tips for sleeping better."]
+  sample_tokens: 128

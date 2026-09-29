@@ -1,0 +1,15 @@
+# ~200M params (~137M non-embedding): the 200M-v5 architecture.
+# 9 layers alternating global / sliding-window attention, hidden 1024 (matches Qwen's
+# embedding width so its token embedding can be warm-started), tied 64K vocab.
+model:
+  vocab_size: 65536
+  hidden_size: 1024
+  num_layers: 9
+  layer_pattern: GL
+  max_seq_len: 8192
+  attention:
+    num_heads: 8
+    num_kv_heads: 2
+    head_dim: 128
+    sliding_window: 512
+    global_rope: first

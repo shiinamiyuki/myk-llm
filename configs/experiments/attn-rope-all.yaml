@@ -1,0 +1,5 @@
+# Positional encoding: RoPE on every global layer (baseline: only the first; rest NoPE).
+base: ablation.yaml
+run_name: ablation-attn-rope-all
+model:
+  attention: {global_rope: all}

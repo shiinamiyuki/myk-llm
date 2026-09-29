@@ -1,0 +1,17 @@
+# Context extension: continue a finished run at 8K tokens with a short decay.
+base: 200m.yaml
+run_name: 200m-pt-8k
+steps: 4000
+global_batch_size: 64
+data:
+  seq_len: 8192
+  micro_batch_size: 4
+optimizer:
+  lr: 1.0e-4
+schedule:
+  kind: wsd
+  warmup_ratio: 0.02
+  decay_ratio: 0.3
+init:
+  embedding_from: ""
+  checkpoint_from: runs/200m-pt/checkpoints/step_0016000

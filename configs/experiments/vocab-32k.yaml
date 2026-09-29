@@ -1,0 +1,21 @@
+# Smaller vocabulary: 32K pruned tokenizer. Needs its own tokenizer and shards:
+#   python scripts/prune_tokenizer.py --output _download_models/Qwen3.5-0.8B-pruned32k \
+#       --corpus data/corpus_en.txt data/corpus_zh.txt --target-vocab 32768
+#   python scripts/pretokenize.py --preset en --tokenizer _download_models/Qwen3.5-0.8B-pruned32k \
+#       --output data/shards-32k/fineweb-edu-en ...   (and zh)
+# Compare against the baseline by val bits-per-byte, not per-token loss.
+base: ablation.yaml
+run_name: ablation-vocab-32k
+model:
+  vocab_size: 32768
+data:
+  tokenizer: _download_models/Qwen3.5-0.8B-pruned32k
+  sources:
+    - {name: en, weight: 0.4, path: data/shards-32k/fineweb-edu-en/train}
+    - {name: zh, weight: 0.6, path: data/shards-32k/fineweb-edu-zh/train}
+init:
+  embedding_row_map: _download_models/Qwen3.5-0.8B-pruned32k/embedding_row_map.npy
+eval:
+  val_sets:
+    - {name: en, sources: [{name: en, path: data/shards-32k/fineweb-edu-en/val}]}
+    - {name: zh, sources: [{name: zh, path: data/shards-32k/fineweb-edu-zh/val}]}
