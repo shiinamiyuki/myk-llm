@@ -414,10 +414,10 @@ class FlashSelfAttention(nn.Module):
             k = torch.cat([kv_cache.keys, k], dim=1)
             v = torch.cat([kv_cache.values, v], dim=1)
 
+        # Attend over the untrimmed k/v and only trim what is kept for the next step:
+        # during a prefill longer than the sliding window, the early queries still need
+        # their own (older) keys, which the trimmed cache no longer holds.
         next_cache = self._trim_cache(k, v) if use_cache else None
-        if next_cache is not None:
-            k = next_cache.keys
-            v = next_cache.values
 
         attn_output = flash_attn_func(
             q=q,
