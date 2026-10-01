@@ -37,6 +37,9 @@ class DeltaNetConfig:
     head_dim: int = 128
     expand_v: float = 1.0
     conv_size: int = 4
+    # Causal depthwise convolution on q/k/v before the delta rule. Its kernel sees
+    # relative offsets directly, so it is also a source of positional information.
+    use_short_conv: bool = True
     use_gate: bool = True
 
 

@@ -146,6 +146,7 @@ class DeltaNet(nn.Module):
             head_dim=cfg.head_dim,
             num_heads=cfg.num_heads,
             use_gate=cfg.use_gate,
+            use_short_conv=cfg.use_short_conv,
             conv_size=cfg.conv_size,
             layer_idx=0,  # each layer owns its own single-entry state object
             mode="chunk",

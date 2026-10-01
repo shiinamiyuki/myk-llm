@@ -43,23 +43,29 @@ def plan(sweep: dict) -> list[tuple[str, str, list[str]]]:
 SEED_SUFFIX = re.compile(r"-s\d+$")
 
 
-def extra_digits(result: dict, threshold: float = 0.5) -> int:
+METRICS = ("accuracy", "accuracy_late", "fillers_accuracy", "fillers_accuracy_late")
+
+
+def extra_digits(result: dict, metric: str = "accuracy", threshold: float = 0.5) -> int:
     """How many lengths beyond training stay at or above `threshold` accuracy, counting
     up from train_digits + 1 until the first failure."""
     count, length = 0, result["train_digits"] + 1
-    while result["accuracy"].get(str(length), 0.0) >= threshold:
+    while result[metric].get(str(length), 0.0) >= threshold:
         count, length = count + 1, length + 1
     return count
 
 
-def report(sweep_dir: Path) -> str:
+def report(sweep_dir: Path, metric: str = "accuracy") -> str:
     """Markdown tables. Runs that differ only in a trailing `-s<k>` (seed) label are
     averaged; `spread` is the largest max-min gap across seeds at any length, and
     `+digits` the mean number of lengths past training at >= 50% accuracy. Only
-    lengths past training are shown, up to the last one any run gets right."""
+    lengths past training are shown, up to the last one any run gets right.
+    `metric` picks the accuracy: final checkpoint ("accuracy"), mean of the
+    second-half evaluations ("accuracy_late"), or the same on prompts with fillers."""
     results = [json.loads(p.read_text()) for p in sorted(sweep_dir.glob("*/results.json"))]
+    results = [{**r, "accuracy": r[metric]} for r in results if metric in r]
     if not results:
-        return "(no finished runs)"
+        return f"(no finished runs with {metric})"
     lines = []
     for task in sorted({r["run_name"].split("-")[0] for r in results}):
         group = [r for r in results if r["run_name"].split("-")[0] == task]
@@ -71,7 +77,7 @@ def report(sweep_dir: Path) -> str:
         for r in group:
             configs.setdefault(SEED_SUFFIX.sub("", r["run_name"]), []).append(r)
         lines += [
-            f"\n### {task} (trained on 1-{train_digits} digits; columns are longer lengths)\n",
+            f"\n### {task}, {metric} (trained on 1-{train_digits} digits; columns are longer lengths)\n",
             "| run | seeds | in-dist | +digits | spread | " + " | ".join(map(str, lengths)) + " | min |",
             "|---|---|---|---|---|" + "---|" * len(lengths) + "---|",
         ]
@@ -80,8 +86,13 @@ def report(sweep_dir: Path) -> str:
             acc = {d: [r["accuracy"].get(str(d), 0.0) for r in runs] for d in lengths}
             spread = max((max(v) - min(v) for v in acc.values()), default=0.0)
             plus = sum(extra_digits(r) for r in runs) / len(runs)
+            train_lengths = [str(d) for d in range(1, train_digits + 1)]
             cells = [f"{100 * sum(v) / len(v):.0f}" for v in acc.values()]
-            in_dist = 100 * sum(r["in_distribution"] for r in runs) / len(runs)
+            in_dist = 100 * sum(
+                sum(r["accuracy"].get(d, 0.0) for d in train_lengths if d in r["accuracy"])
+                / max(1, sum(d in r["accuracy"] for d in train_lengths))
+                for r in runs
+            ) / len(runs)
             minutes = sum(r["train_minutes"] for r in runs) / len(runs)
             rows.append((-plus, f"| {name} | {len(runs)} | {in_dist:.1f} | {plus:.1f} | {100 * spread:.0f} | "
                          + " | ".join(cells) + f" | {minutes:.1f} |"))
@@ -93,6 +104,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("sweep")
     parser.add_argument("--report", action="store_true", help="only print the summary table")
+    parser.add_argument("--metric", choices=METRICS, default=None, help="accuracy to tabulate (default: all available)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-dir", default="runs/arith")
     args = parser.parse_args()
@@ -115,7 +127,9 @@ def main() -> None:
                     code = subprocess.call(command, stdout=handle, stderr=subprocess.STDOUT)
                 if code:
                     print(f"  failed (exit {code}); see {log}", flush=True)
-    table = report(sweep_dir)
+    metrics = [args.metric] if args.metric else list(METRICS)
+    table = "\n".join(t for t in (report(sweep_dir, m) for m in metrics) if not t.startswith("(no finished"))
+    table = table or "(no finished runs)"
     print(table)
     if sweep_dir.exists():
         (sweep_dir / "summary.md").write_text(table + "\n", encoding="utf-8")

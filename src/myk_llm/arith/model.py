@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from ..data.config import Batch
 from ..model import MykLLM, ModelConfig
-from .tasks import EOS, CharTokenizer, TaskConfig, parse_answer, render, sample_operand, true_answer
+from .tasks import EOS, CharTokenizer, TaskConfig, add_fillers, parse_answer, render, sample_operand, true_answer
 
 
 @dataclass
@@ -103,9 +103,11 @@ def completion_budget(task: TaskConfig, digits: int) -> int:
 
 @torch.no_grad()
 def evaluate_lengths(
-    model: ArithModel, task: TaskConfig, lengths: list[int], examples: int, seed: int, batch_size: int = 512
+    model: ArithModel, task: TaskConfig, lengths: list[int], examples: int, seed: int, batch_size: int = 512,
+    fillers: bool = False,
 ) -> dict[int, float]:
-    """Exact-match accuracy of the final answer, both operands `d` digits, for each d."""
+    """Exact-match accuracy of the final answer, both operands `d` digits, for each d.
+    `fillers` inserts FILLER characters into the prompts as in training."""
     was_training = model.training
     model.eval()
     rng = random.Random(seed)
@@ -116,7 +118,10 @@ def evaluate_lengths(
         correct = 0
         for start in range(0, examples, batch_size):
             chunk = problems[start : start + batch_size]
-            completions = model.greedy_complete([render(a, b, task)[0] for a, b in chunk], budget)
+            prompts = [render(a, b, task)[0] for a, b in chunk]
+            if fillers:
+                prompts = [add_fillers(p, rng, task.filler_prob, task.max_fillers) for p in prompts]
+            completions = model.greedy_complete(prompts, budget)
             correct += sum(
                 parse_answer(c, task) == true_answer(a, b, task) and c.endswith(EOS)
                 for c, (a, b) in zip(completions, chunk)

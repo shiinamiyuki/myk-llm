@@ -66,3 +66,27 @@ def test_greedy_never_emits_ids_outside_the_character_set():
     model.lm.logits = unused_id_wins
     completions = model.greedy_complete(["12+34=", "5*6="], max_new_tokens=8)
     assert all(set(c) <= set(CharTokenizer().chars) for c in completions)
+
+
+def test_fillers_only_add_filler_characters():
+    from myk_llm.arith.tasks import FILLER, add_fillers
+
+    rng = random.Random(0)
+    prompt = render(12345, 678, TaskConfig())[0]
+    seen_filler = False
+    for _ in range(200):
+        noisy = add_fillers(prompt, rng, prob=0.3, max_fillers=3)
+        assert noisy.replace(FILLER, "") == prompt and noisy.endswith("=") and noisy[0] != FILLER
+        assert FILLER * 4 not in noisy
+        seen_filler |= FILLER in noisy
+    assert seen_filler
+    assert add_fillers(prompt, rng, prob=0.0, max_fillers=3) == prompt
+
+
+def test_filler_training_rows_keep_completions_clean():
+    task = TaskConfig(filler_prob=0.5)
+    tokenizer = CharTokenizer()
+    batch = next(iter(PackedArithmetic(task, batch_rows=2, row_len=256, seed=0)))
+    filler_id = tokenizer.index["_"]
+    supervised = batch.targets[batch.targets != IGNORE_INDEX]
+    assert (batch.input_ids == filler_id).any() and not (supervised == filler_id).any()

@@ -136,3 +136,49 @@ Reading: longer training does not unlock extrapolation for this architecture; it
 best early (while the in-distribution fit is still imperfect) and decays as the model
 fits the training lengths, i.e. the length-specific solution wins over time. Whatever
 generalizes at 2k steps is not what training converges to.
+
+### GD NoPE without the DeltaNet short convolution (2026-10-01)
+
+Same setup as above with `model.deltanet.use_short_conv=false` (no RoPE, no
+convolution: the only order information left is the recurrence itself and causal
+masking). Accuracy (%) past training, mean of the evaluations at steps 10k-18k
+(200 problems per length) and the final evaluation (500 per length):
+
+| run | 11 (10k-18k) | 12 | 13 | final 11 / 12 / 13 |
+|---|---|---|---|---|
+| with conv, s0 | 0 | 0 | 0 | (not saved) |
+| with conv, s1 | 18 | 0 | 0 | (not saved) |
+| no conv, s0 | 98 | 84 | 38 | 100 / 98 / 54 |
+| no conv, s1 | 100 | 91 | 51 | 63 / 0 / 0 |
+
+Reading: the short convolution is what destroys extrapolation in the GD hybrid.
+Without it, extrapolation does not decay with training; over the second half of
+training both seeds sit at roughly +2-3 digits, as good as the best pure-NoPE
+attention model, while learning almost as fast as with the convolution (in
+distribution at 100% by ~8k steps). The value at any single checkpoint is very
+noisy (s1 went from 100/79 at 18k to 63/0 at the end), so compare runs by averages
+over many checkpoints, and expect checkpoint choice to matter.
+
+### filler augmentation (sweep 3, 2026-10-02; 3 seeds)
+
+`configs/arith/sweeps/filler.yaml`: GD, no RoPE, CoT addition, 20k steps. "filler":
+each gap between prompt characters gets 1-3 `_` with probability 0.2 (training and the
+filler evaluation; completions are never padded). Mean of second-half evaluations
+(`--metric accuracy_late`), accuracy % past the 1-10 digit training range:
+
+| run | +digits | 11 | 12 | 13 | 14 |
+|---|---|---|---|---|---|
+| noconv, filler | 2.7 | 96 | 79 | 50 | 22 |
+| noconv, clean | 2.3 | 98 | 82 | 45 | 18 |
+| conv, filler | 1.3 | 91 | 36 | 6 | 0 |
+| conv, clean | 0.3 | 19 | 1 | 0 | 0 |
+
+Per seed, conv clean -> conv filler at 11 digits: 1 -> 98, 53 -> 82, 3 -> 94.
+
+Reading: randomizing prompt offsets restores about one digit of extrapolation to the
+model with the short convolution, consistently across seeds, so the convolution's
+harm is (at least partly) a fixed-offset shortcut. It does not close the gap to the
+model without the convolution: the CoT itself still has a rigid fixed-width layout
+the model can count through, and p=0.2 is a mild perturbation. Fillers neither help
+nor hurt the model without the convolution, and models trained with fillers are
+equally accurate on clean and filler prompts.

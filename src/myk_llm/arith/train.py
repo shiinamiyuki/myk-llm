@@ -57,6 +57,8 @@ def train(config: ArithConfig) -> dict:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "config.yaml").write_text(dump_yaml(config), encoding="utf-8")
 
+    if config.digit_embedding.enabled and config.task.filler_prob > 0:
+        raise ValueError("digit_embedding counts runs of consecutive digits, which fillers break up")
     model = ArithModel(config.model, config.digit_embedding).to(device)
     optimizers = build_optimizers(model.lm, config.optimizer)
     if model.digit_embed is not None:
@@ -68,6 +70,9 @@ def train(config: ArithConfig) -> dict:
     loader = iter(build_loader(config.task, config.batch_rows, config.row_len, config.seed, config.num_workers))
     metrics = MetricsLogger(run_dir / "metrics.jsonl")
     lengths = config.task.eval_lengths()
+    # Prompt variants to evaluate: clean always; with fillers too when training used them.
+    variants = {"": False, "fillers_": True} if config.task.filler_prob > 0 else {"": False}
+    late: dict[str, list[dict[int, float]]] = {prefix: [] for prefix in variants}
     params = model.lm.num_parameters(exclude_embeddings=True)
     print(f"[{config.run_name}] {params / 1e6:.2f}M non-embedding params, "
           f"{config.batch_rows}x{config.row_len} tokens/step, {config.steps} steps", flush=True)
@@ -96,14 +101,21 @@ def train(config: ArithConfig) -> dict:
             loss_sum = token_sum = 0.0
             window_start = time.perf_counter()
         if config.eval_interval and step % config.eval_interval == 0 and step != config.steps:
-            accuracy = evaluate_lengths(model, config.task, lengths, config.eval_examples, seed=step)
-            metrics.log(step, {f"acc/{d}": a for d, a in accuracy.items()})
-            print(f"[{config.run_name}] step {step} acc " + " ".join(f"{d}:{a:.2f}" for d, a in accuracy.items()), flush=True)
+            for prefix, fillers in variants.items():
+                accuracy = evaluate_lengths(model, config.task, lengths, config.eval_examples, seed=step, fillers=fillers)
+                metrics.log(step, {f"{prefix}acc/{d}": a for d, a in accuracy.items()})
+                print(f"[{config.run_name}] step {step} {prefix}acc " + " ".join(f"{d}:{a:.2f}" for d, a in accuracy.items()), flush=True)
+                if step >= config.steps // 2:
+                    late[prefix].append(accuracy)
             window_start = time.perf_counter()
 
     # Save before the (slow) final evaluation so an interrupted eval can be redone.
     torch.save({"config": dump_yaml(config), "state_dict": model.state_dict()}, run_dir / "model.pt")
-    accuracy = evaluate_lengths(model, config.task, lengths, config.final_eval_examples, seed=12345)
+    finals = {
+        prefix: evaluate_lengths(model, config.task, lengths, config.final_eval_examples, seed=12345, fillers=fillers)
+        for prefix, fillers in variants.items()
+    }
+    accuracy = finals[""]
     results = {
         "run_name": config.run_name,
         "accuracy": accuracy,
@@ -113,10 +125,17 @@ def train(config: ArithConfig) -> dict:
         "non_embedding_params": params,
         "train_minutes": (time.perf_counter() - started) / 60,
     }
-    metrics.log(config.steps, {f"final_acc/{d}": a for d, a in accuracy.items()})
+    for prefix, final in finals.items():
+        if prefix:
+            results[f"{prefix}accuracy"] = final
+        # Single checkpoints are noisy for out-of-distribution lengths; the mean over the
+        # in-training evaluations of the second half is a steadier summary.
+        if late[prefix]:
+            results[f"{prefix}accuracy_late"] = {d: sum(a[d] for a in late[prefix]) / len(late[prefix]) for d in lengths}
+        metrics.log(config.steps, {f"final_{prefix}acc/{d}": a for d, a in final.items()})
+        print(f"[{config.run_name}] final {prefix}acc " + " ".join(f"{d}:{a:.3f}" for d, a in final.items()), flush=True)
     metrics.close()
     (run_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
-    print(f"[{config.run_name}] final acc " + " ".join(f"{d}:{a:.3f}" for d, a in accuracy.items()), flush=True)
     return results
 
 

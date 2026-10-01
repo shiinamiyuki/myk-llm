@@ -26,8 +26,10 @@ from typing import Literal
 
 EOS = "$"
 PAD = "#"
-# Fixed character vocabulary; id 0 is padding.
-VOCAB = [PAD, EOS, *"0123456789", "+", "*", "=", "|", ":", ",", ";", ">"]
+FILLER = "_"  # meaningless character randomly inserted into prompts (task.filler_prob)
+# Fixed character vocabulary; id 0 is padding. New characters go at the end so the ids
+# of existing ones never change.
+VOCAB = [PAD, EOS, *"0123456789", "+", "*", "=", "|", ":", ",", ";", ">", FILLER]
 
 
 class CharTokenizer:
@@ -56,6 +58,11 @@ class TaskConfig:
     min_digits: int = 1
     train_digits: int = 10
     reverse_operands: bool = False
+    # Data augmentation: each gap between prompt characters gets, with this probability,
+    # 1..max_fillers FILLER characters. Distances between digits (and to "=") then vary
+    # from problem to problem, so a solution that counts fixed offsets cannot work.
+    filler_prob: float = 0.0
+    max_fillers: int = 3
     # Evaluation lengths (both operands this many digits); empty -> 1..2*train_digits.
     eval_digits: list[int] = field(default_factory=list)
 
@@ -102,6 +109,19 @@ def render(a: int, b: int, config: TaskConfig) -> tuple[str, str]:
     else:
         completion = (_cot_add(a, b) if config.op == "add" else _cot_mul(a, b)) + "|" + str(answer)
     return prompt, completion + EOS
+
+
+def add_fillers(prompt: str, rng: random.Random, prob: float, max_fillers: int) -> str:
+    """Insert FILLER runs into the gaps of `prompt` (before every character except the
+    leading one; the prompt still ends with '=')."""
+    if prob <= 0:
+        return prompt
+    out = [prompt[0]]
+    for char in prompt[1:]:
+        if rng.random() < prob:
+            out.append(FILLER * rng.randint(1, max_fillers))
+        out.append(char)
+    return "".join(out)
 
 
 def parse_answer(completion: str, config: TaskConfig) -> int | None:

@@ -13,6 +13,7 @@ VARIANTS = {
     "baseline": {},
     "qknorm_gate_rope_all": {"attention.qk_norm": "true", "attention.output_gate": "true", "attention.global_rope": "all"},
     "deltanet": {"layer_pattern": "GD"},
+    "deltanet_no_conv": {"layer_pattern": "GD", "deltanet.use_short_conv": "false"},
     "ngram": {"ngram.orders": "[2, 3]", "ngram.num_buckets": "1024", "ngram.dim": "32"},
     "ngram_mid_layers": {"ngram.orders": "[2]", "ngram.num_buckets": "1024", "ngram.dim": "128", "ngram.layers": "[0, 2]"},
     "residual_input": {"residual.gate": "input"},

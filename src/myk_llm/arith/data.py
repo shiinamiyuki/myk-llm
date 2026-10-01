@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 from ..data.config import IGNORE_INDEX, Batch
-from .tasks import CharTokenizer, TaskConfig, render, sample_problem
+from .tasks import CharTokenizer, TaskConfig, add_fillers, render, sample_problem
 
 
 def encode_example(tokenizer: CharTokenizer, prompt: str, completion: str) -> tuple[list[int], list[int]]:
@@ -42,7 +42,9 @@ class PackedArithmetic(IterableDataset):
             lengths: list[int] = []
             while True:
                 if pending is None:
-                    pending = encode_example(self.tokenizer, *render(*sample_problem(rng, self.task), self.task))
+                    prompt, completion = render(*sample_problem(rng, self.task), self.task)
+                    prompt = add_fillers(prompt, rng, self.task.filler_prob, self.task.max_fillers)
+                    pending = encode_example(self.tokenizer, prompt, completion)
                 if len(pending[0]) > self.row_len:
                     raise ValueError(f"an example ({len(pending[0])} tokens) exceeds row_len {self.row_len}")
                 if len(ids) + len(pending[0]) > self.row_len:

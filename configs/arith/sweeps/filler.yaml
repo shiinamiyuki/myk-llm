@@ -1,0 +1,28 @@
+# Sweep 3: can random fillers in the prompt stop the GD model from relying on fixed
+# offsets, even with DeltaNet's short convolution? GD pattern, no RoPE, CoT addition,
+# 20k steps, 3 seeds. "clean" rows reproduce the earlier long runs as baselines.
+#   python -m myk_llm.arith.sweep configs/arith/sweeps/filler.yaml
+#   python -m myk_llm.arith.sweep configs/arith/sweeps/filler.yaml --report --metric accuracy_late
+name: filler
+configs:
+  add: configs/arith/add.yaml
+overrides:
+  - model.layer_pattern=GD
+  - model.attention.global_rope=none
+  - "model.deltanet={num_heads: 4, head_dim: 64, expand_v: 1.0}"
+  - task.format=cot
+  - steps=20000
+  - eval_interval=2000
+  - "task.eval_digits=[8, 9, 10, 11, 12, 13, 14, 15, 16]"
+  - final_eval_examples=500
+axes:
+  conv:
+    conv: [model.deltanet.use_short_conv=true]
+    noconv: [model.deltanet.use_short_conv=false]
+  aug:
+    clean: [task.filler_prob=0.0]
+    filler: [task.filler_prob=0.2, task.max_fillers=3]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]
+    s2: [seed=2]
