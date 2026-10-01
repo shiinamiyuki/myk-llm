@@ -67,6 +67,9 @@ NNODES=2 MASTER_ADDR=node0 scripts/launch.sh configs/pretrain/200m.yaml   # on e
   when more than one GPU is used; one FSDP unit per transformer block. Options under
   `parallel:` — `param_dtype: bf16` (less memory / communication), `activation_checkpointing`,
   `reshard_after_forward: false` (more memory, fewer all-gathers), `compile`.
+- **FP8:** `parallel.float8: tensorwise` (needs `pip install -e '.[fp8]'`) runs the block
+  linears in FP8: +20–31% tokens/s and less activation memory on an RTX 5090. See
+  [fp8.md](fp8.md).
 - **Muon** works on sharded parameters (momentum per shard, orthogonalization on the
   gathered matrix; every rank does all matrices, which is fine up to ~1B params).
 - **Resume:** re-run the same command; it continues from the newest complete checkpoint

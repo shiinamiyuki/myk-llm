@@ -23,6 +23,8 @@ dependencies = [
 [project.optional-dependencies]
 # Gated DeltaNet (linear attention) mixer layers.
 linear-attn = ["flash-linear-attention>=0.5"]
+# FP8 matmuls in training (parallel.float8).
+fp8 = ["torchao>=0.9"]
 dev = ["pytest>=8"]
 
 [tool.setuptools.packages.find]

@@ -1,0 +1,7 @@
+# FP8 (8-bit floating point) matmuls in the block linears, tensorwise dynamic scaling
+# (torchao Float8Linear). Not an architecture change: compare val bpb against
+# ablation-baseline to confirm FP8 is loss-neutral at this scale. See notes/fp8.md.
+base: ablation.yaml
+run_name: ablation-fp8
+parallel:
+  float8: tensorwise

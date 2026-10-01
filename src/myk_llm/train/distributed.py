@@ -8,6 +8,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 from ..model import MykLLM
 from .config import ParallelConfig
@@ -67,13 +68,46 @@ def uses_fsdp(config: ParallelConfig, info: DistInfo) -> bool:
     return config.strategy == "fsdp"
 
 
+def convert_float8(model: MykLLM, recipe: str) -> int:
+    """Swap eligible linears for torchao's Float8Linear; returns how many were swapped.
+
+    Skipped: the output head (it shares the embedding table and the fused loss reads its
+    weight directly), linears inside Gated DeltaNet layers (they run outside
+    torch.compile, where the unfused FP8 casts cost about what the matmuls save), and
+    linears with a dimension not divisible by 16 (an FP8 matmul requirement).
+    """
+    try:
+        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+    except ImportError as error:  # pragma: no cover - optional dependency
+        raise ImportError("parallel.float8 needs torchao: pip install torchao") from error
+    from ..model.mixers import DeltaNet
+
+    eager = {id(m) for mixer in model.modules() if isinstance(mixer, DeltaNet) for m in mixer.modules()}
+
+    def eligible(module: nn.Module, fqn: str) -> bool:
+        return (
+            isinstance(module, nn.Linear)
+            and fqn != "lm_head"
+            and id(module) not in eager
+            and module.in_features % 16 == 0
+            and module.out_features % 16 == 0
+        )
+
+    before = sum(isinstance(m, nn.Linear) for m in model.modules())
+    convert_to_float8_training(model, config=Float8LinearConfig.from_recipe_name(recipe), module_filter_fn=eligible)
+    return before - sum(type(m) is nn.Linear for m in model.modules())
+
+
 def parallelize(model: MykLLM, config: ParallelConfig, info: DistInfo) -> MykLLM:
-    """Activation checkpointing, torch.compile and FSDP2 sharding, in that order.
+    """FP8 conversion, activation checkpointing, torch.compile and FSDP2 sharding, in
+    that order.
 
     Each block is its own FSDP unit (all-gathered just before it runs); the root unit
     holds the embeddings, final norm and output head. Gradients are reduced as a SUM:
     the objectives already normalize by the global number of supervised tokens.
     """
+    if config.float8 != "none":
+        convert_float8(model, config.float8)
     if config.activation_checkpointing:
         model.set_activation_checkpointing(True)
     if config.compile:

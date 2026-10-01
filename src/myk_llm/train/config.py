@@ -77,6 +77,11 @@ class ParallelConfig:
     reshard_after_forward: bool = True  # False trades memory for less all-gather traffic
     compile: bool = True
     activation_checkpointing: bool = False
+    # FP8 (8-bit floating point) matmuls in the block linears via torchao's Float8Linear,
+    # with dynamic scaling; master weights, optimizer and output head are unchanged.
+    # A torchao recipe name; "tensorwise" is the fast one (see notes/fp8.md). The
+    # rowwise recipes fail under autocast with fp32 parameters in torchao 0.9.
+    float8: Literal["none", "tensorwise", "rowwise", "rowwise_with_gw_hp"] = "none"
 
 
 @dataclass
