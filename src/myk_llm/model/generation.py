@@ -5,7 +5,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .transformer import MykLLM
+from .transformer import MykLLM, ModelOutput
+
+
+def _last_logits(model: MykLLM, output: ModelOutput) -> tuple[ModelOutput, torch.Tensor]:
+    # Runs as the forward's head: under FSDP the output head is only gathered there.
+    return output, model.logits(output.hidden[:, -1]).float()
 
 
 @torch.no_grad()
@@ -36,9 +41,8 @@ def generate(
     tokens = input_ids
     batch = tokens.size(0)
     context = model.embed.context
-    output = model(tokens, use_cache=True)
+    output, logits = model(tokens, use_cache=True, head=_last_logits)
     cache = output.cache
-    logits = model.logits(output.hidden[:, -1]).float()
     finished = torch.zeros(batch, dtype=torch.bool, device=tokens.device)
     prompt_len = tokens.size(1)
 
@@ -57,9 +61,10 @@ def generate(
             break
         position = torch.full((batch, 1), tokens.size(1) - 1, device=tokens.device, dtype=torch.long)
         prefix = tokens[:, -1 - context : -1] if context else None
-        output = model(tokens[:, -1:], position_ids=position, cache=cache, use_cache=True, prefix_ids=prefix)
+        output, logits = model(
+            tokens[:, -1:], position_ids=position, cache=cache, use_cache=True, prefix_ids=prefix, head=_last_logits
+        )
         cache = output.cache
-        logits = model.logits(output.hidden[:, -1]).float()
     return tokens
 
 

@@ -1,8 +1,9 @@
-"""Multi-process checks on CPU (gloo), so they run without multiple GPUs."""
+"""Multi-process checks: CPU (gloo) ones run without GPUs; FSDP-on-CUDA ones use one GPU."""
 
 import os
 import socket
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -57,3 +58,42 @@ def test_muon_on_fsdp_shards_matches_unsharded(tmp_path):
     sharded = torch.load(out_path)
     for name, expected in _reference_state(0).items():
         torch.testing.assert_close(sharded[name], expected, rtol=1e-4, atol=1e-5)
+
+
+def _fsdp_generate_worker(rank: int, port: int, out_path: str) -> None:
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    dist.init_process_group("nccl", rank=0, world_size=1, device_id=device)
+    from conftest import tiny_model_config
+    from myk_llm.model import MykLLM, generate
+    from myk_llm.train.config import ParallelConfig
+    from myk_llm.train.distributed import DistInfo, parallelize
+
+    torch.manual_seed(0)
+    model = parallelize(
+        MykLLM(tiny_model_config()).to(device),
+        ParallelConfig(strategy="fsdp", compile=False),
+        DistInfo(0, 1, 0, device),
+    ).eval()
+    ids = torch.arange(1, 9, device=device)[None]
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        tokens = generate(model, ids, max_new_tokens=8, temperature=0.0)
+    torch.save(tokens.cpu(), out_path)
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+def test_generate_under_fsdp_matches_unsharded(tmp_path):
+    """Sampling during training: the output head is sharded outside forward under FSDP."""
+    from conftest import tiny_model_config
+    from myk_llm.model import MykLLM, generate
+
+    out_path = str(tmp_path / "tokens.pt")
+    mp.spawn(_fsdp_generate_worker, args=(_free_port(), out_path), nprocs=1, join=True)
+    torch.manual_seed(0)
+    model = MykLLM(tiny_model_config()).cuda().eval()
+    ids = torch.arange(1, 9, device="cuda")[None]
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        expected = generate(model, ids, max_new_tokens=8, temperature=0.0)
+    assert torch.equal(torch.load(out_path), expected.cpu())
