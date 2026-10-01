@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -39,25 +40,52 @@ def plan(sweep: dict) -> list[tuple[str, str, list[str]]]:
     return runs
 
 
+SEED_SUFFIX = re.compile(r"-s\d+$")
+
+
+def extra_digits(result: dict, threshold: float = 0.5) -> int:
+    """How many lengths beyond training stay at or above `threshold` accuracy, counting
+    up from train_digits + 1 until the first failure."""
+    count, length = 0, result["train_digits"] + 1
+    while result["accuracy"].get(str(length), 0.0) >= threshold:
+        count, length = count + 1, length + 1
+    return count
+
+
 def report(sweep_dir: Path) -> str:
-    """Markdown table: in-distribution mean accuracy, then accuracy per length."""
+    """Markdown tables. Runs that differ only in a trailing `-s<k>` (seed) label are
+    averaged; `spread` is the largest max-min gap across seeds at any length, and
+    `+digits` the mean number of lengths past training at >= 50% accuracy. Only
+    lengths past training are shown, up to the last one any run gets right."""
     results = [json.loads(p.read_text()) for p in sorted(sweep_dir.glob("*/results.json"))]
     if not results:
         return "(no finished runs)"
     lines = []
     for task in sorted({r["run_name"].split("-")[0] for r in results}):
         group = [r for r in results if r["run_name"].split("-")[0] == task]
-        lengths = sorted({int(d) for r in group for d in r["accuracy"]})
         train_digits = group[0]["train_digits"]
-        header = [f"{d}{'*' if d > train_digits else ''}" for d in lengths]
+        lengths = sorted({int(d) for r in group for d in r["accuracy"]} - set(range(train_digits + 1)))
+        while lengths and all(r["accuracy"].get(str(lengths[-1]), 0.0) == 0.0 for r in group):
+            lengths.pop()
+        configs: dict[str, list[dict]] = {}
+        for r in group:
+            configs.setdefault(SEED_SUFFIX.sub("", r["run_name"]), []).append(r)
         lines += [
-            f"\n### {task} (trained on 1-{train_digits} digits; * = longer than training)\n",
-            "| run | in-dist | " + " | ".join(header) + " | min |",
-            "|---|---|" + "---|" * len(lengths) + "---|",
+            f"\n### {task} (trained on 1-{train_digits} digits; columns are longer lengths)\n",
+            "| run | seeds | in-dist | +digits | spread | " + " | ".join(map(str, lengths)) + " | min |",
+            "|---|---|---|---|---|" + "---|" * len(lengths) + "---|",
         ]
-        for r in sorted(group, key=lambda r: r["run_name"]):
-            cells = [f"{100 * r['accuracy'].get(str(d), float('nan')):.0f}" for d in lengths]
-            lines.append(f"| {r['run_name']} | {100 * r['in_distribution']:.1f} | " + " | ".join(cells) + f" | {r['train_minutes']:.1f} |")
+        rows = []
+        for name, runs in configs.items():
+            acc = {d: [r["accuracy"].get(str(d), 0.0) for r in runs] for d in lengths}
+            spread = max((max(v) - min(v) for v in acc.values()), default=0.0)
+            plus = sum(extra_digits(r) for r in runs) / len(runs)
+            cells = [f"{100 * sum(v) / len(v):.0f}" for v in acc.values()]
+            in_dist = 100 * sum(r["in_distribution"] for r in runs) / len(runs)
+            minutes = sum(r["train_minutes"] for r in runs) / len(runs)
+            rows.append((-plus, f"| {name} | {len(runs)} | {in_dist:.1f} | {plus:.1f} | {100 * spread:.0f} | "
+                         + " | ".join(cells) + f" | {minutes:.1f} |"))
+        lines += [row for _, row in sorted(rows)]
     return "\n".join(lines)
 
 

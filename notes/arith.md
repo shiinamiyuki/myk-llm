@@ -87,3 +87,52 @@ seeds, so treat gaps of a few digits as noise until repeated):
   50) is only marginally better than plain NoPE.
 - In-distribution the task is too easy to separate settings; comparisons need a tighter
   budget (fewer steps / smaller models) or harder tasks.
+
+### hybrid (sweep 2, 2026-10-01; addition, 2 seeds per cell)
+
+`configs/arith/sweeps/hybrid.yaml`: 6 layers; G = global attention, L = sliding window
+of 32 tokens (always RoPE), D = Gated DeltaNet (no positional encoding of its own).
+Full table: `runs/arith/hybrid/summary.md`. All cells are 100% on 1-10 digits.
+
+| arch | RoPE | format | +digits (>=50%) | 11 | 12 | 13 | 14 |
+|---|---|---|---|---|---|---|---|
+| G | none | revrev | 3.0 | 100 | 100 | 90 | 8 |
+| G | none | cot | 2.5 | 99 | 89 | 51 | 9 |
+| GD | global | cot | 0.5 | 31 | 0 | 0 | 0 |
+| GD | none | cot | 0 | 18 | 0 | 0 | 0 |
+| GD, D | any | revrev | 0 | 0 | 0 | 0 | 0 |
+| D | - | cot | 0 | 0 | 0 | 0 | 0 |
+| GL | none / first / all | both | 0 | 0 | 0 | 0 | 0 |
+| G | all | both | 0 | 0 | 0 | 0 | 0 |
+
+(revrev = reversed answer + reversed operands.) Training loss at step 300 (mean of
+seeds), cot / revrev: D and GD 0.007-0.011 / 0.03; GL and G-RoPE 0.03-0.06 / 0.29-0.31;
+G-NoPE 0.13 / 0.46. Throughput: D/GD 1.2-1.7M tok/s vs 1.8-2.2M for attention only.
+
+Reading: any positional signal - RoPE (even only in the local layers) or the
+recurrence / short convolution of DeltaNet - makes the task much faster to learn and
+removes length extrapolation; only the fully position-free attention model
+extrapolates (by ~3 digits). Adding DeltaNet layers to NoPE global layers removes the
+extrapolation that NoPE alone has. Open questions: does this survive longer training
+(NoPE learns slowest and may be under-trained at 5000 steps), and is DeltaNet's
+positional signal coming from its short convolution?
+
+### GD NoPE, long training (2026-10-01)
+
+GD pattern, no RoPE anywhere, CoT format, 20000 steps (4x sweep 2), 2 seeds; accuracy
+evaluated every 2000 steps (200 problems per length). Both runs finished training but
+were stopped during the final evaluation (no `results.json`); numbers below are the
+in-training evaluations. Accuracy (%) at 11 digits (trained on 1-10):
+
+| seed | 2k | 4k | 6k | 8k | 10k | 12k | 14k | 16k | 18k |
+|---|---|---|---|---|---|---|---|---|---|
+| s0 | 17 | 7 | 1 | 3 | 1 | 0 | 0 | 1 | 0 |
+| s1 | 82 | 51 | 26 | 6 | 24 | 14 | 12 | 26 | 12 |
+
+12 digits: s1 33% at 2k, <= 3% afterwards; s0 <= 1% throughout. In-distribution
+(10 digits) rises from 93-97% at 2k to 100%.
+
+Reading: longer training does not unlock extrapolation for this architecture; it is
+best early (while the in-distribution fit is still imperfect) and decays as the model
+fits the training lengths, i.e. the length-specific solution wins over time. Whatever
+generalizes at 2k steps is not what training converges to.

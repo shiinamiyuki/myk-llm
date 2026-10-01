@@ -1,0 +1,28 @@
+# Sweep 2: hybrid layer patterns and where RoPE goes (addition only; 2 seeds).
+#   python -m myk_llm.arith.sweep configs/arith/sweeps/hybrid.yaml
+# 6 layers in all patterns. Problems are short (<= ~200 tokens), so the sliding window is
+# cut to 32 tokens for "L" layers to actually be local (the 512 default would make them
+# global). Gated DeltaNet ("D") layers have no positional encoding of their own; the
+# RoPE choice applies to the global ("G") layers. Local layers always use RoPE.
+name: hybrid
+configs:
+  add: configs/arith/add.yaml
+overrides:
+  - model.attention.sliding_window=32
+  - "model.deltanet={num_heads: 4, head_dim: 64, expand_v: 1.0}"
+axes:
+  arch:
+    G_rope: [model.layer_pattern=G, model.attention.global_rope=all]
+    G_nope: [model.layer_pattern=G, model.attention.global_rope=none]
+    GL_globalnope: [model.layer_pattern=GL, model.attention.global_rope=none]
+    GL_firstrope: [model.layer_pattern=GL, model.attention.global_rope=first]   # the 200M recipe
+    GL_allrope: [model.layer_pattern=GL, model.attention.global_rope=all]
+    GD_rope: [model.layer_pattern=GD, model.attention.global_rope=all]
+    GD_nope: [model.layer_pattern=GD, model.attention.global_rope=none]
+    D: [model.layer_pattern=D]
+  format:
+    cot: [task.format=cot]
+    revrev: [task.format=reverse, task.reverse_operands=true]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]

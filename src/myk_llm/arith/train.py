@@ -101,6 +101,8 @@ def train(config: ArithConfig) -> dict:
             print(f"[{config.run_name}] step {step} acc " + " ".join(f"{d}:{a:.2f}" for d, a in accuracy.items()), flush=True)
             window_start = time.perf_counter()
 
+    # Save before the (slow) final evaluation so an interrupted eval can be redone.
+    torch.save({"config": dump_yaml(config), "state_dict": model.state_dict()}, run_dir / "model.pt")
     accuracy = evaluate_lengths(model, config.task, lengths, config.final_eval_examples, seed=12345)
     results = {
         "run_name": config.run_name,
@@ -114,7 +116,6 @@ def train(config: ArithConfig) -> dict:
     metrics.log(config.steps, {f"final_acc/{d}": a for d, a in accuracy.items()})
     metrics.close()
     (run_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
-    torch.save({"config": dump_yaml(config), "state_dict": model.state_dict()}, run_dir / "model.pt")
     print(f"[{config.run_name}] final acc " + " ".join(f"{d}:{a:.3f}" for d, a in accuracy.items()), flush=True)
     return results
 

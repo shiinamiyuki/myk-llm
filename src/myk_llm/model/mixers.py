@@ -154,6 +154,9 @@ class DeltaNet(nn.Module):
     def residual_projections(self) -> list[nn.Linear]:
         return [self.inner.o_proj]
 
+    # fla's layers are hand-written Triton kernels; tracing them into a compiled block
+    # gains nothing, and Inductor fails on the inference-mode (fused_recurrent) path.
+    @torch.compiler.disable
     def forward(
         self,
         x: torch.Tensor,
