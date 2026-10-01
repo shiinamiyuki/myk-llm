@@ -168,10 +168,14 @@ class MykLLM(nn.Module):
         use_cache: bool = False,
         prefix_ids: torch.Tensor | None = None,
         head: Callable[["MykLLM", ModelOutput], Any] | None = None,
+        embed_offset: torch.Tensor | None = None,
     ) -> Any:
         """`seqlens` enables document masking (training); `cache`/`use_cache` drive
         incremental decoding; `prefix_ids` are the tokens preceding `input_ids`
         (needed by n-gram embeddings when decoding with a cache).
+
+        `embed_offset` (batch, seq_len, hidden) is added to the input embeddings (e.g. a
+        task-specific positional signal computed outside the model).
 
         Returns a ModelOutput, or `head(self, output)` when `head` is given. Losses run
         as a head so that they execute inside forward: under FSDP (fully sharded data
@@ -186,6 +190,8 @@ class MykLLM(nn.Module):
                 raise ValueError("document masking (seqlens) cannot be combined with a cache")
             varlen = build_varlen(seqlens, batch, seq_len, input_ids.device)
         x, ngram_updates = self.embed(input_ids, prefix_ids)
+        if embed_offset is not None:
+            x = x + embed_offset
         states = cache if cache is not None else [None] * len(self.layers)
         new_cache: list[Any] | None = [] if use_cache else None
         for index, (block, state) in enumerate(zip(self.layers, states)):

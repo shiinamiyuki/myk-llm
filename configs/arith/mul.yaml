@@ -1,0 +1,5 @@
+# Multiplication: train on 1-5 digit operands, evaluate 1-8 digits.
+base: base.yaml
+run_name: mul
+steps: 10000
+task: {op: mul, format: cot, train_digits: 5, eval_digits: [1, 2, 3, 4, 5, 6, 7, 8]}

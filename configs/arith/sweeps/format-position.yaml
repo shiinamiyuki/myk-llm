@@ -1,0 +1,19 @@
+# First sweep: output format x positional mechanism, for addition and multiplication.
+#   python -m myk_llm.arith.sweep configs/arith/sweeps/format-position.yaml
+# "abacus" follows McLeish et al. (2024): no RoPE, a learned digit-index embedding, and
+# operands written least-significant digit first so the index equals the digit's place.
+# (That also changes the prompt, so compare it with nope-rev to separate the two effects.)
+name: format-position
+configs:
+  add: configs/arith/add.yaml
+  mul: configs/arith/mul.yaml
+axes:
+  format:
+    direct: [task.format=direct]
+    reverse: [task.format=reverse]
+    cot: [task.format=cot]
+  position:
+    rope: [model.attention.global_rope=all]
+    nope: [model.attention.global_rope=none]
+    noperev: [model.attention.global_rope=none, task.reverse_operands=true]
+    abacus: [model.attention.global_rope=none, task.reverse_operands=true, digit_embedding.enabled=true]

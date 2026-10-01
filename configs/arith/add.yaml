@@ -1,0 +1,4 @@
+# Addition: train on 1-10 digit operands, evaluate 1-20 digits (11-20 = length generalization).
+base: base.yaml
+run_name: add
+task: {op: add, format: cot, train_digits: 10}

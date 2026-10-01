@@ -1,0 +1,18 @@
+# Character-level arithmetic testbed (python -m myk_llm.arith.train <config>).
+# ~6.3M non-embedding params: 6 global-attention layers, hidden 256, 4 heads of 64.
+output_dir: runs/arith
+steps: 5000
+batch_rows: 64
+row_len: 1024                  # 64K tokens per step, many problems packed per row
+model:
+  vocab_size: 32
+  hidden_size: 256
+  num_layers: 6
+  layer_pattern: G
+  max_seq_len: 2048
+  attention: {num_heads: 4, num_kv_heads: 4, head_dim: 64, global_rope: all}
+optimizer: {name: muon, lr: 1.0e-3, weight_decay: 0.0}
+schedule: {kind: cosine, warmup_ratio: 0.02, min_lr_ratio: 0.1}
+eval_interval: 1000
+eval_examples: 200
+final_eval_examples: 1000

@@ -6,13 +6,28 @@ from myk_llm.configuration import apply_overrides, from_dict, load_config
 from myk_llm.model import ModelConfig
 from myk_llm.train.config import TrainConfig
 
-CONFIGS = sorted((Path(__file__).parent.parent / "configs").rglob("*.yaml"))
+ROOT = Path(__file__).parent.parent / "configs"
+CONFIGS = sorted(p for p in ROOT.rglob("*.yaml") if "sweeps" not in p.parts)
 
 
-@pytest.mark.parametrize("path", CONFIGS, ids=lambda p: str(p.relative_to(p.parent.parent)))
+@pytest.mark.parametrize("path", CONFIGS, ids=lambda p: str(p.relative_to(ROOT)))
 def test_every_config_parses(path):
-    config = load_config(TrainConfig, path)
+    from myk_llm.arith.train import ArithConfig
+
+    config = load_config(ArithConfig if path.relative_to(ROOT).parts[0] == "arith" else TrainConfig, path)
     assert config.model.num_layers > 0
+
+
+def test_arith_sweeps_expand():
+    import yaml
+
+    from myk_llm.arith.sweep import plan
+
+    for path in (ROOT / "arith" / "sweeps").glob("*.yaml"):
+        for _, config_path, overrides in plan(yaml.safe_load(path.read_text())):
+            from myk_llm.arith.train import ArithConfig
+
+            load_config(ArithConfig, ROOT.parent / config_path, overrides)
 
 
 def test_overrides_are_typed():
