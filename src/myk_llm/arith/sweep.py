@@ -40,6 +40,25 @@ def plan(sweep: dict) -> list[tuple[str, str, list[str]]]:
     return runs
 
 
+def run_all(runs: list[tuple[str, str, list[str]]], sweep_dir: Path, module: str, dry_run: bool = False) -> None:
+    """Run each planned run as `python -m <module>` in a fresh process, skipping finished
+    ones (those with a results.json); each run logs to <sweep_dir>/<run>/train.log."""
+    for index, (name, config_path, overrides) in enumerate(runs, start=1):
+        if (sweep_dir / name / "results.json").exists():
+            print(f"[{index}/{len(runs)}] {name}: done, skipping", flush=True)
+            continue
+        command = [sys.executable, "-m", module, config_path, *overrides, f"run_name={name}", f"output_dir={sweep_dir}"]
+        print(f"[{index}/{len(runs)}] {name}: {' '.join(overrides)}", flush=True)
+        if dry_run:
+            continue
+        log = sweep_dir / name / "train.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("w") as handle:
+            code = subprocess.call(command, stdout=handle, stderr=subprocess.STDOUT)
+        if code:
+            print(f"  failed (exit {code}); see {log}", flush=True)
+
+
 SEED_SUFFIX = re.compile(r"-s\d+$")
 
 
@@ -112,21 +131,7 @@ def main() -> None:
     sweep_dir = Path(args.output_dir) / sweep["name"]
 
     if not args.report:
-        runs = plan(sweep)
-        for index, (name, config_path, overrides) in enumerate(runs, start=1):
-            if (sweep_dir / name / "results.json").exists():
-                print(f"[{index}/{len(runs)}] {name}: done, skipping", flush=True)
-                continue
-            command = [sys.executable, "-m", "myk_llm.arith.train", config_path, *overrides,
-                       f"run_name={name}", f"output_dir={sweep_dir}"]
-            print(f"[{index}/{len(runs)}] {name}: {' '.join(overrides)}", flush=True)
-            if not args.dry_run:
-                log = sweep_dir / name / "train.log"
-                log.parent.mkdir(parents=True, exist_ok=True)
-                with log.open("w") as handle:
-                    code = subprocess.call(command, stdout=handle, stderr=subprocess.STDOUT)
-                if code:
-                    print(f"  failed (exit {code}); see {log}", flush=True)
+        run_all(plan(sweep), sweep_dir, "myk_llm.arith.train", args.dry_run)
     metrics = [args.metric] if args.metric else list(METRICS)
     table = "\n".join(t for t in (report(sweep_dir, m) for m in metrics) if not t.startswith("(no finished"))
     table = table or "(no finished runs)"

@@ -1,0 +1,27 @@
+# Synthetic long-context retrieval testbed (python -m myk_llm.lc.train <config>).
+# ~8.4M non-embedding params: 8 layers, hidden 256, 4 heads of 64. Patterns tile over
+# the 8 layers (GLLL / DDDG appear twice). The sliding window (256) is below the
+# training length, so local layers cannot see across a context. See notes/lc-retrieval.md.
+output_dir: runs/lc
+steps: 8000                    # calibration: retrieval appears at ~3-4K steps (DeltaNet later than attention)
+batch_rows: 32                 # x task.max_len (2048) = 64K tokens per step
+model:
+  vocab_size: 512              # task vocabulary is 464 ids
+  hidden_size: 256
+  num_layers: 8
+  layer_pattern: G
+  max_seq_len: 65536           # longest evaluation length (RoPE tables)
+  attention: {num_heads: 4, num_kv_heads: 4, head_dim: 64, sliding_window: 256, global_rope: all}
+  deltanet: {num_heads: 4, head_dim: 64, expand_v: 1.0}
+optimizer: {name: muon, lr: 1.0e-3, weight_decay: 0.0}
+schedule: {kind: cosine, warmup_ratio: 0.02, min_lr_ratio: 0.1}
+eval_interval: 500
+# Training mix found by calibration (notes/lc-retrieval.md): without copy examples and
+# easy (few-record) examples, retrieval was not learned within 12K steps at all.
+task:
+  length_dist: log_uniform
+  min_len: 128
+  min_records: 1
+  copy_fraction: 0.25
+eval_queries: 200
+final_eval_queries: 1000

@@ -1,0 +1,24 @@
+# E1 - capacity: how many associations can each architecture hold? Multi-query associative
+# recall (MQAR) with 32 / 128 / 256 records in 2048 tokens; evaluation keeps the record
+# density, so longer contexts also mean more records.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/e1-capacity.yaml
+name: e1-capacity
+configs:
+  capacity: configs/lc/capacity.yaml
+axes:
+  arch:
+    G_rope: [model.layer_pattern=G, model.attention.global_rope=all]
+    L: [model.layer_pattern=L]                                  # control: window 256 < context
+    D: [model.layer_pattern=D]
+    D_noconv: [model.layer_pattern=D, model.deltanet.use_short_conv=false]
+    D_wide: [model.layer_pattern=D, model.deltanet.head_dim=128]  # 4x the recurrent state
+    GD: [model.layer_pattern=GD, model.attention.global_rope=none]
+    DDDG: [model.layer_pattern=DDDG, model.attention.global_rope=none]
+    GLLL: [model.layer_pattern=GLLL, model.attention.global_rope=first]
+  load:
+    n32: [task.num_records=32]
+    n128: [task.num_records=128]
+    n256: [task.num_records=256]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]

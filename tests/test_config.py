@@ -13,21 +13,26 @@ CONFIGS = sorted(p for p in ROOT.rglob("*.yaml") if "sweeps" not in p.parts)
 @pytest.mark.parametrize("path", CONFIGS, ids=lambda p: str(p.relative_to(ROOT)))
 def test_every_config_parses(path):
     from myk_llm.arith.train import ArithConfig
+    from myk_llm.lc.train import LcConfig
 
-    config = load_config(ArithConfig if path.relative_to(ROOT).parts[0] == "arith" else TrainConfig, path)
+    classes = {"arith": ArithConfig, "lc": LcConfig}
+    config = load_config(classes.get(path.relative_to(ROOT).parts[0], TrainConfig), path)
     assert config.model.num_layers > 0
 
 
-def test_arith_sweeps_expand():
+@pytest.mark.parametrize("testbed", ["arith", "lc"])
+def test_sweeps_expand(testbed):
     import yaml
 
     from myk_llm.arith.sweep import plan
+    from myk_llm.arith.train import ArithConfig
+    from myk_llm.lc.train import LcConfig
 
-    for path in (ROOT / "arith" / "sweeps").glob("*.yaml"):
+    paths = list((ROOT / testbed / "sweeps").glob("*.yaml"))
+    assert paths
+    for path in paths:
         for _, config_path, overrides in plan(yaml.safe_load(path.read_text())):
-            from myk_llm.arith.train import ArithConfig
-
-            load_config(ArithConfig, ROOT.parent / config_path, overrides)
+            load_config({"arith": ArithConfig, "lc": LcConfig}[testbed], ROOT.parent / config_path, overrides)
 
 
 def test_overrides_are_typed():

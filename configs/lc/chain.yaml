@@ -1,0 +1,6 @@
+# Multi-hop chains (variable tracking): 8 chains of 1-4 hops in noise, 4 queried; the
+# answer is the value at the end of the chain (task.cot=true writes the intermediate keys).
+base: base.yaml
+run_name: chain
+task: {min_len: 256, max_len: 2048, num_records: 8, num_queries: 4, hops: [1, 2, 3, 4],
+       eval_lengths: [512, 1024, 2048, 4096, 8192, 16384]}

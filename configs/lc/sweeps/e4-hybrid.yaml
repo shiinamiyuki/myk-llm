@@ -1,0 +1,22 @@
+# E4 - hybrid design choices for the real model's long-context stage, on E2's task:
+# global-layer ratio and placement, what the other layers are, window, RoPE, attention
+# tweaks. Baselines (GLLL, GLLL_nope, DDDG, GD) are in E2.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/e4-hybrid.yaml --report --at 16384
+name: e4-hybrid
+configs:
+  needle: configs/lc/needle.yaml
+axes:
+  variant:
+    GLLLLLLL: [model.layer_pattern=GLLLLLLL, model.attention.global_rope=first]   # 1:7
+    LLLG: [model.layer_pattern=LLLG, model.attention.global_rope=first]           # global last in group
+    GDDD: [model.layer_pattern=GDDD, model.attention.global_rope=none]            # global first in group
+    GDDDDDDD: [model.layer_pattern=GDDDDDDD, model.attention.global_rope=none]    # 1:7
+    GLLL_w64: [model.layer_pattern=GLLL, model.attention.global_rope=first, model.attention.sliding_window=64]
+    GLLL_w1024: [model.layer_pattern=GLLL, model.attention.global_rope=first, model.attention.sliding_window=1024]
+    GLLL_ropeall: [model.layer_pattern=GLLL, model.attention.global_rope=all]
+    GLLL_theta4: [model.layer_pattern=GLLL, model.attention.global_rope=all, model.attention.rope_theta_global=10000.0]
+    GLLL_qkgate: [model.layer_pattern=GLLL, model.attention.global_rope=first, model.attention.qk_norm=true, model.attention.output_gate=true]
+    G_nope_qkgate: [model.layer_pattern=G, model.attention.global_rope=none, model.attention.qk_norm=true, model.attention.output_gate=true]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]

@@ -1,0 +1,5 @@
+# Needle regime: 8 key -> value records in noise, 4 of them queried. Trained on 128-2048
+# tokens, evaluated at 512-64K with the same 8 records (only the distance grows).
+base: base.yaml
+run_name: needle
+task: {max_len: 2048, num_records: 8, num_queries: 4, hops: [1]}

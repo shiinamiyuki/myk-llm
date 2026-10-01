@@ -1,0 +1,7 @@
+# Capacity regime (multi-query associative recall): 128 records in 2048 tokens (half of
+# the context is records), 16 queried. Records scale with length, so evaluating longer
+# contexts keeps the load per token, not the count.
+base: base.yaml
+run_name: capacity
+task: {length_dist: uniform, min_len: 2048, max_len: 2048, num_records: 128, scale_records: true, num_queries: 16, hops: [1],
+       eval_lengths: [512, 1024, 2048, 4096, 8192, 16384]}

@@ -1,0 +1,20 @@
+# E3 - multi-hop retrieval: chains of 1-4 hops, answered directly or by writing every
+# intermediate key first (CoT). Report per hop count with --at.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/e3-chain.yaml --report --at 2048
+name: e3-chain
+configs:
+  chain: configs/lc/chain.yaml
+axes:
+  arch:
+    G_rope: [model.layer_pattern=G, model.attention.global_rope=all]
+    G_nope: [model.layer_pattern=G, model.attention.global_rope=none]
+    GLLL: [model.layer_pattern=GLLL, model.attention.global_rope=first]
+    GD: [model.layer_pattern=GD, model.attention.global_rope=none]
+    DDDG: [model.layer_pattern=DDDG, model.attention.global_rope=none]
+    D: [model.layer_pattern=D]
+  format:
+    direct: [task.cot=false]
+    cot: [task.cot=true]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]
