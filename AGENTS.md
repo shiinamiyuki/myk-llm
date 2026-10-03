@@ -6,4 +6,4 @@
 - Code lives in the `myk_llm` package under `src/` (installed editable: `pip install -e .`). Layout and workflow: README.md and notes/pipeline.md.
 - Every training run is a YAML config under `configs/`; add experiments as new config files rather than new CLI flags.
 - Run `python -m pytest` after changes; GPU tests need CUDA. `configs/experiments/smoke.yaml` is a few-minute end-to-end run.
-- You are running inside a sandbox. Ask user if you encountered environment issues.
+- You are running inside a sandbox (symlinks will be resolved to full path, which could be different from what the user is seeing). Ask user if you encountered environment issues.
