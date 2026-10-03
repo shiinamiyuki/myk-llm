@@ -1,7 +1,7 @@
 # Long-context retrieval testbed — experiment design
 
 Status (2026-10-01): implemented (`src/myk_llm/lc/`, `configs/lc/`), calibrated (below);
-sweeps E1-E4 written, not yet run. E5 is to be written from E2/E4's results; E6 needs
+sweeps E1-E4 written; E2 done (results below). E5 is to be written from E2/E4's results; E6 needs
 the server checkpoints.
 
 Question: how do the architectures this repo can build (global / sliding-window
@@ -187,6 +187,52 @@ G-rope at 8K, by needle depth (0% = start of the context): 29, 25, 22, 55, 58, 7
 16K is flat across depths (77-99). The sweeps use 8000 steps so the slowest learners
 (DeltaNet) are past the transition with margin; `learned_step` is reported per run so
 a late transition is not mistaken for inability.
+
+## E2 results: retrieval at length (2026-10-02)
+
+`configs/lc/sweeps/e2-length.yaml`, 2 seeds, 8000 steps, trained on 128-2048 tokens;
+8 records in noise, 4 queried; final checkpoint, 1000 queries per length. eff@90 /
+eff@50: longest length up to which accuracy stays >= 90% / 50% (mean of seeds).
+Full table: `runs/lc/e2-length/summary.md`.
+
+| arch | learned at | eff@90 | 2K | 4K | 8K | 16K | 32K | 64K |
+|---|---|---|---|---|---|---|---|---|
+| DDDG (global NoPE) | 500-1000 | 64K | 100 | 100 | 100 | 100 | 100 | 100 |
+| GLLL, global NoPE | 1500 | 48K | 100 | 100 | 100 | 100 | 98 | 84 |
+| G NoPE | 1500 | 32K | 100 | 100 | 100 | 100 | 97 | 74 |
+| GLLL, RoPE on first G (600M recipe) | 1500 | 24K | 100 | 100 | 100 | 99 | 90 | 61 |
+| GL, RoPE on first G (200M recipe) | 1500 | 24K | 100 | 100 | 100 | 99 | 87 | 42 |
+| D | 3000-3500 | 24K | 100 | 99 | 99 | 98 | 90 | 32 |
+| D, no short conv | 3500-4000 | 18K | 99 | 98 | 90 | 53 | 47 | 30 |
+| GD (global NoPE) | 1000-1500 | 16K | 100 | 100 | 99 | 97 | 68 | 22 |
+| G RoPE | 1000 | 4K | 100 | 95 | 59 | 18 | 3 | 0 |
+| L (window 256) | 6000-6500 | 1K | 76 | 39 | 19 | 10 | 6 | 2 |
+
+Seed spread is large past 16K for some rows (64K: GL 76 / 8, GLLL 89 / 32, D 22 / 42,
+D no-conv 0 / 59 — its seed 0 already fails at 16K, 8%); the top three rows are
+consistent across seeds (DDDG 100 / 100; GLLL-NoPE 98 / 70; G-NoPE 65 / 82).
+
+Depth profile at 16K: G-RoPE finds only recent needles (1-6% in the first 60% of the
+context, 88% in the last tenth); L only within its stacked receptive field (8 x 256);
+every other model is flat across depths (GD slightly lower for the earliest needles,
+91-93%). No recency bias in DeltaNet at this load.
+
+Readings:
+- **RoPE on global layers is what breaks extrapolation**, as in arith: G-RoPE collapses
+  past 2x the training length, G-NoPE holds 97% at 16x. One RoPE global layer among
+  NoPE ones (the 200M / 600M recipes) costs a lot past 16K (GLLL 90 / 61 vs GLLL-NoPE
+  98 / 84 at 32K / 64K). Local layers with RoPE do not hurt: GLLL-NoPE >= G-NoPE.
+- **The 3:1 DeltaNet hybrid with NoPE global layers is the best model here**: perfect
+  to 64K on both seeds, and it learned fastest. Pure DeltaNet extrapolates well to 32K
+  but fades at 64K; its short convolution helps retrieval (without it, one seed fails
+  at 16K) — the opposite of arith, where the convolution destroyed length
+  generalization (content lookup vs position-aligned computation).
+- **GD (1:1) is worse than DDDG** past 16K although it has more global layers. One
+  difference is the last layer (D in GD, global attention in DDDG); E4's GDDD vs DDDG
+  tests placement directly.
+- Caveats: light load (8 records); E1 (capacity) is where DeltaNet's fixed state should
+  matter. RoPE + training-free dynamic YaRN (next section) also reaches 100% to 64K, so
+  "RoPE vs NoPE" is really "plain RoPE vs NoPE or scaled RoPE".
 
 ## RoPE extension on the G-rope checkpoint (2026-10-01)
 
