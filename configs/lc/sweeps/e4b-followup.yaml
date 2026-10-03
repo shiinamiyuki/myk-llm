@@ -1,0 +1,27 @@
+# E4 follow-up: e4-hybrid varies ratio and placement with RoPE on the first global layer,
+# which E2 found to be the main cause of failure past the training length. Repeat them
+# with NoPE global layers; test whether a window large enough to cover the training length
+# (1024 x 6 local layers > 2048) hurts even without RoPE on the global layers; third seeds
+# for the DeltaNet placement pair (GDDD's two seeds disagreed). Labels carry the seed so
+# the report groups them.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/e4b-followup.yaml --report --at 16384
+name: e4b-followup
+configs:
+  needle: configs/lc/needle.yaml
+axes:
+  run:
+    GLLLLLLL_nope-s0: [model.layer_pattern=GLLLLLLL, model.attention.global_rope=none, seed=0]
+    GLLLLLLL_nope-s1: [model.layer_pattern=GLLLLLLL, model.attention.global_rope=none, seed=1]
+    LLLG_nope-s0: [model.layer_pattern=LLLG, model.attention.global_rope=none, seed=0]
+    LLLG_nope-s1: [model.layer_pattern=LLLG, model.attention.global_rope=none, seed=1]
+    GLLL_nope_w1024-s0: [model.layer_pattern=GLLL, model.attention.global_rope=none, model.attention.sliding_window=1024, seed=0]
+    GLLL_nope_w1024-s1: [model.layer_pattern=GLLL, model.attention.global_rope=none, model.attention.sliding_window=1024, seed=1]
+    GDDD-s2: [model.layer_pattern=GDDD, model.attention.global_rope=none, seed=2]
+    DDDG-s2: [model.layer_pattern=DDDG, model.attention.global_rope=none, seed=2]
+    # a global layer at depth 0 turned out not to retrieve; redo 1:7 and 1:1 with the global layer last
+    LLLLLLLG_nope-s0: [model.layer_pattern=LLLLLLLG, model.attention.global_rope=none, seed=0]
+    LLLLLLLG_nope-s1: [model.layer_pattern=LLLLLLLG, model.attention.global_rope=none, seed=1]
+    DDDDDDDG-s0: [model.layer_pattern=DDDDDDDG, model.attention.global_rope=none, seed=0]
+    DDDDDDDG-s1: [model.layer_pattern=DDDDDDDG, model.attention.global_rope=none, seed=1]
+    DG-s0: [model.layer_pattern=DG, model.attention.global_rope=none, seed=0]
+    DG-s1: [model.layer_pattern=DG, model.attention.global_rope=none, seed=1]

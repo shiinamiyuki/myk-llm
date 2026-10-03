@@ -1,7 +1,7 @@
 # Long-context retrieval testbed — experiment design
 
-Status (2026-10-01): implemented (`src/myk_llm/lc/`, `configs/lc/`), calibrated (below);
-sweeps E1-E4 written; E2 done (results below). E5 is to be written from E2/E4's results; E6 needs
+Status (2026-10-03): implemented (`src/myk_llm/lc/`, `configs/lc/`), calibrated (below);
+sweeps E1-E4 written; E2 and E4 done (results below). E5 is to be written from E2/E4's results; E6 needs
 the server checkpoints.
 
 Question: how do the architectures this repo can build (global / sliding-window
@@ -126,7 +126,8 @@ limit and the pure-D gap shrinks. 24 runs.
 **E4 — hybrid design for the real model.** On E2's task: ratio of global layers
 (1:1, 1:3, 1:7), placement of the global layer in the repeating group (first / last),
 mixer of the non-global layers (L vs D), window size, global RoPE first / all / none,
-theta. Output: a concrete recommendation for the long-context stage. 20 runs.
+theta. Output: a concrete recommendation for the long-context stage. 20 runs, plus a
+14-run follow-up (results below).
 
 **E5 — train long vs extrapolate.** The best 3 configurations from E2/E4: trained at
 2K only; at 2K then 10% of steps at 8K (the staged recipe of training.md §4c, in
@@ -233,6 +234,110 @@ Readings:
 - Caveats: light load (8 records); E1 (capacity) is where DeltaNet's fixed state should
   matter. RoPE + training-free dynamic YaRN (next section) also reaches 100% to 64K, so
   "RoPE vs NoPE" is really "plain RoPE vs NoPE or scaled RoPE".
+
+## E4 results: hybrid design (2026-10-03)
+
+`configs/lc/sweeps/e4-hybrid.yaml` (20 runs) and `configs/lc/sweeps/e4b-followup.yaml`
+(14 runs), same task and protocol as E2. The written sweep varied ratio and placement
+with RoPE on the first global layer, which E2 had already shown to be harmful, so the
+follow-up repeats them with NoPE global layers, adds the global layer last at 1:1 and
+1:7, tests the window-1024 failure without RoPE, and gives GDDD / DDDG a third seed.
+Full tables: `runs/lc/e4-hybrid/summary.md`, `runs/lc/e4b-followup/summary.md`.
+
+Layer pattern, ratio and placement (global layers listed by index, R = RoPE; mean of
+seeds, per-seed 64K in brackets where the seeds disagree):
+
+| pattern | global layers | 2K | 8K | 16K | 32K | 64K |
+|---|---|---|---|---|---|---|
+| **DG** (1:1) | 1 3 5 7 | 100 | 100 | 100 | 100 | 100 |
+| **DDDG** (1:3, 3 seeds) | 3 7 | 100 | 100 | 100 | 100 | 100 |
+| **DDDDDDDG** (1:7) | 7 | 100 | 100 | 100 | 100 | 100 |
+| **LLLG** NoPE (1:3) | 3 7 | 100 | 100 | 100 | 100 | 100 |
+| **LLLLLLLG** NoPE (1:7) | 7 | 100 | 100 | 100 | 100 | 100 |
+| GLLL NoPE (E2) | 0 4 | 100 | 100 | 100 | 98 | 84 (98 / 70) |
+| GLLL, RoPE first (E2; 600M recipe) | 0R 4 | 100 | 100 | 99 | 90 | 61 (89 / 32) |
+| GL, RoPE first (E2; 200M recipe) | 0R 2 4 6 | 100 | 100 | 99 | 87 | 42 (76 / 8) |
+| GDDD (3 seeds) | 0 4 | 100 | 99 | 84 | 69 | 65 (92 / 3 / 100) |
+| GD (E2) | 0 2 4 6 | 100 | 99 | 97 | 68 | 22 |
+| GDDDDDDD | 0 | 100 | 100 | 90 | 42 | 11 (22 / 0) |
+| GLLLLLLL, RoPE first | 0R | 98 | 74 | 53 | 29 | 12 (0 / 24) |
+| LLLG, RoPE first | 3R 7 | 100 | 61 | 27 | 12 | 6 |
+| GLLLLLLL NoPE | 0 | 75 | 17 | 9 | 4 | 1 |
+
+Window, RoPE and attention variants, all on GLLL (global layers 0 and 4):
+
+| variant | 2K | 4K | 8K | 16K | 32K | 64K |
+|---|---|---|---|---|---|---|
+| window 256, RoPE first (E2 baseline) | 100 | 100 | 100 | 99 | 90 | 61 |
+| window 64 | 100 | 100 | 99 | 85 | 24 | 2 |
+| window 1024 | 100 | 72 (49 / 96) | 58 | 43 | 17 | 0 |
+| window 1024, NoPE | 100 | 74 (100 / 49) | 62 | 56 | 51 | 44 (84 / 3) |
+| RoPE on all global layers (theta 1e6) | 100 | 96 | 66 | 26 | 6 | 1 |
+| RoPE on all, theta 1e4 | 100 | 56 | 25 | 9 | 2 | 0 |
+| QK-norm + output gate | 100 | 100 | 98 | 69 | 3 | 0 |
+| G NoPE + QK-norm + output gate (vs G NoPE in E2) | 100 | 100 | 100 | 99 (100) | 78 (97) | 44 (74); per seed 0 / 89 |
+
+Every run learned the task in distribution (`learned_step` 500-3500) except GLLLLLLL
+NoPE (seed 0 never, seed 1 at 6500).
+
+Readings:
+- **A NoPE global layer as the last layer solves the task at every ratio.** DG, DDDG,
+  DDDDDDDG, LLLG and LLLLLLLG (NoPE) are all 100% at every length to 64K on every seed
+  (2-3 each), flat across depths. With that placement, the ratio (1:1 to 1:7) and the
+  other mixer (local attention vs DeltaNet) make no difference on this task; one global
+  layer in 8 is enough. Same ratio, shifted by one layer: GD 22% at 64K, DG 100%.
+- **A global layer at layer 0 does not retrieve.** GLLLLLLL NoPE, whose only global
+  layer is layer 0, never learns the task even at 2K; it finds only needles inside the
+  local layers' reach (0% for the first 10% of a 2K context). Plausible reason: at layer 0
+  no earlier layer has written the key into the value tokens yet, so the induction
+  pattern (match the key, read what follows) is impossible. GDDDDDDD (only layer 0
+  global) behaves like pure DeltaNet (E2 D: 98 / 90 / 32), i.e. the DeltaNet layers do
+  the retrieval. So in the GL / GLLL recipes, the RoPE layer 0 is mostly not the
+  retrieval layer; this is why "RoPE on the first global layer" costs only moderately in
+  E2. Moving that RoPE layer to where retrieval happens (LLLG with RoPE first: RoPE on
+  layer 3) gives the plain-RoPE failure: 27% at 16K, finds only the most recent needles
+  (0-4% in the first half, 96-100% in the last fifth), same as RoPE on all global layers.
+- **Global layers that are not last cost accuracy past 16K** even with NoPE (GLLL NoPE
+  84, G NoPE 74, GD 22, GDDD unstable: 92 / 3 / 100 at 64K, the failing seed with a
+  recency profile). Hypothesis, not tested: a NoPE layer that does not attend sharply
+  outputs an average over the whole context, which drifts with L, and every layer
+  after it sees that drift; a last layer passes it only to the LM head.
+- **RoPE on retrieving global layers fails as in E2**; theta 1e4 is worse than 1e6 (56%
+  vs 96% at 4K), as expected from more dimensions completing full turns within 2K.
+- **The window has to stay well below the training length.** With window 1024 the six
+  local layers cover the 2K training context, and per seed the model learns either the
+  global-layer solution (flat across depths, extrapolates: NoPE seed 0, 84% at 64K) or a
+  local one that is bound to the training distance (at 4K: 0-1% for needles in the first
+  half, 99-100% in the last 2K). This happens with and without RoPE on the global layers.
+  Window 64 is worse than 256 too (with RoPE first; not tested with NoPE).
+- **QK-norm + output gate did not help**: worse on GLLL on both seeds (69% vs 99% at 16K);
+  on G NoPE the seeds disagree (0% and 89% at 64K vs 74% without). The norms carry
+  learnable scales, so the reachable logit scale is learned; whether it gets large
+  enough for sharp attention at 64K seems seed-dependent.
+- Caveats: light load (8 records, 4 queried); the configurations that saturate here
+  must be separated on capacity (E1) and multi-hop (E3) before the ratio is cut to 1:7.
+  Tiny model (8 layers); the 200M / 600M stacks are 9 / 33 layers.
+
+**Recommendation for the long-context stage** (to verify with E6 at 200M scale):
+1. Global layers NoPE (`global_rope: none`). If RoPE stays (it is in the trained 200M
+   checkpoints), keep it only on layer 0, which barely retrieves, and plan on dynamic
+   YaRN for that layer (RoPE extension section below).
+2. End the stack with a global layer. The 9-layer GL (globals 0, 2, ..., 8) and 33-layer
+   GLLL (0, 4, ..., 32) patterns already do; the global layer 0 contributes little to
+   retrieval, so a new design can put the local / DeltaNet layers first (LLLG, DDDG).
+3. Ratio: 1:3 (DDDG / LLLG) until E1 / E3 show that 1:7 holds under load; here even
+   1:7 was perfect.
+4. Window: do not raise it to 1K-4K for the long stage as training.md §4a suggests
+   without testing it; here a window large enough for the local layers to cover the
+   training context let some seeds learn a retrieval path that stops at the training
+   length.
+5. Local attention vs DeltaNet: no difference in retrieval at this load; decide on E1
+   (state capacity) and throughput.
+6. QK-norm + output gate: no gain for long-context retrieval; do not adopt for that reason.
+
+For E5: the configurations above are already at 100% to 64K, so a long-training phase can
+only show something on those that fail: the current recipes (GL / GLLL with RoPE first),
+GD, D; or on a heavier task (more records).
 
 ## RoPE extension on the G-rope checkpoint (2026-10-01)
 
