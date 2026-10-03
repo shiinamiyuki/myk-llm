@@ -12,3 +12,6 @@ tokenize.sh
 training-scripts/
 runs/
 .pytest_cache/
+start-agentbox.sh
+.gitignore
+setenv.sh
