@@ -1,7 +1,7 @@
 # Long-context retrieval testbed — experiment design
 
 Status (2026-10-03): implemented (`src/myk_llm/lc/`, `configs/lc/`), calibrated (below);
-sweeps E1-E4 written; E2 and E4 done (results below). E5 is to be written from E2/E4's results; E6 needs
+sweeps E1-E4 written; E2, E3 and E4 done (results below). E5 is to be written from E2/E4's results; E6 needs
 the server checkpoints.
 
 Question: how do the architectures this repo can build (global / sliding-window
@@ -121,7 +121,8 @@ RoPE's failure even when the global layers are NoPE? 20 runs.
 **E3 — multi-hop.** `chain`, h = 1-4 mixed in training, evaluate per h up to 16K,
 direct vs CoT; G-rope, G-nope, GLLL, DDDG, GD, D. Hypotheses: direct h-hop answers need
 several global layers (DDDG with 2 global layers fails at h >= 3?); CoT removes that
-limit and the pure-D gap shrinks. 24 runs.
+limit and the pure-D gap shrinks. 24 runs as written; run with 4 more architectures (40)
+plus 6 longer runs (results below).
 
 **E4 — hybrid design for the real model.** On E2's task: ratio of global layers
 (1:1, 1:3, 1:7), placement of the global layer in the repeating group (first / last),
@@ -325,8 +326,9 @@ Readings:
 2. End the stack with a global layer. The 9-layer GL (globals 0, 2, ..., 8) and 33-layer
    GLLL (0, 4, ..., 32) patterns already do; the global layer 0 contributes little to
    retrieval, so a new design can put the local / DeltaNet layers first (LLLG, DDDG).
-3. Ratio: 1:3 (DDDG / LLLG) until E1 / E3 show that 1:7 holds under load; here even
-   1:7 was perfect.
+3. Ratio: 1:3 (DDDG / LLLG). Here even 1:7 was perfect, but E3 shows 1:7 cannot
+   answer multi-hop questions directly (2 hops 57%, 3-4 hops at chance), while 1:3
+   reaches 83-97% and 1:1 90-96%.
 4. Window: do not raise it to 1K-4K for the long stage as training.md §4a suggests
    without testing it; here a window large enough for the local layers to cover the
    training context let some seeds learn a retrieval path that stops at the training
@@ -338,6 +340,64 @@ Readings:
 For E5: the configurations above are already at 100% to 64K, so a long-training phase can
 only show something on those that fail: the current recipes (GL / GLLL with RoPE first),
 GD, D; or on a heavier task (more records).
+
+## E3 results: multi-hop chains (2026-10-03)
+
+`configs/lc/sweeps/e3-chain.yaml`: 8 chains of 1-4 hops (mixed) in noise, 4 queried,
+trained on 256-2048 tokens, evaluated to 16K; answers direct (`v v v v`) or CoT (every
+intermediate key, then the value). The written six architectures plus E4's best placement
+(NoPE global layer last) at 1:1 / 1:3 / 1:7: DG, DDDDDDDG, LLLG, LLLLLLLG. 2 seeds,
+8000 steps (40 runs). Some direct runs were still improving at 8000 steps, so
+`configs/lc/sweeps/e3b-long.yaml` repeats the direct format for 6 architectures with
+24000 steps (seed 0 only). Full tables: `runs/lc/e3-chain/summary.md`,
+`runs/lc/e3b-long/summary.md`.
+
+Accuracy per hop count (h = 1 / 2 / 3 / 4), mean of seeds:
+
+| arch | CoT 2K | CoT 16K | direct 8K steps, 2K | direct 24K steps, 2K | direct 24K steps, 16K |
+|---|---|---|---|---|---|
+| DG (1:1) | 100 all | 100 all | 58 / 34 / 33 / 16 | 100 / 96 / 95 / 96 | 100 / 96 / 93 / 90 |
+| DDDG (1:3) | 100 all | 100 all | 99 / 17 / 17 / 16 | 100 / 97 / 90 / 83 | 100 / 95 / 92 / 81 |
+| LLLG NoPE (1:3) | 100 all | 100 all | 98 / 16 / 15 / 16 | 100 / 94 / 94 / 79 | 100 / 94 / 85 / 47 |
+| DDDDDDDG (1:7) | 100 all | 100 all | 99 / 15 / 19 / 16 | 100 / 57 / 17 / 14 | 99 / 59 / 17 / 13 |
+| LLLLLLLG NoPE (1:7) | 100 all | 100 all | 93 / 16 / 15 / 17 | | |
+| GD | 100 all | 100 all | 99 / 19 / 19 / 18 | | |
+| GLLL, RoPE first | 100 all | 94-96 | 99 / 16 / 15 / 17 | | |
+| G NoPE | 100 all | 98 / 96 / 93 / 91 | 98 / 68 / 18 / 18 | 100 / 99 / 73 / 39 | 100 / 98 / 69 / 31 |
+| G RoPE | 100 all | 34 / 20 / 10 / 6 | 99 / 89 / 89 / 24 | 100 / 94 / 72 / 57 | 19 / 3 / 4 / 3 |
+| D | 100 / 99 / 99 / 98 | 99 / 98 / 96 / 96 | 79 / 17 / 15 / 15 | | |
+
+Guessing one of the 8 values scores 12.5%, so 15-19% means the hop count is not solved.
+CoT runs learned at 1000-2500 steps (D 4000-5000); in 24000 steps, direct runs learned
+(>= 90% overall) at 13500 (DG), 14000 (LLLG), 21500 (DDDG), never (G NoPE, G RoPE,
+DDDDDDDG).
+
+Readings:
+- **With CoT, multi-hop is as easy as single-hop.** Every architecture learns every hop
+  count within 2500 steps (D: 5000), and accuracy at length follows E2 / E4: the NoPE
+  global layer last stays at 100% to 16K at every ratio, G RoPE fails past 2K (72% at 8K
+  over all hops), the rest hold 91-99% at 16K.
+- **Direct multi-hop is learned late, not impossible for hybrids.** At 8000 steps
+  every hybrid answered only 1-hop queries; with 24000 steps DG and DDDG reach 83-97% on
+  2-4 hops, against the design's hypothesis that DDDG (2 global layers) fails at h >= 3.
+  E3 at 8000 steps alone would have read as "hybrids cannot do multi-hop".
+- **Direct multi-hop depends on the number of global layers among hybrids**: 1:1 (4
+  global layers) > 1:3 (2) > 1:7 (1: 2 hops 57%, 3-4 at chance after 24000 steps). This is
+  the first task where the 1:7 ratio falls short. The all-global models are not best:
+  G NoPE (8 global layers) reaches only 73 / 39% on 3 / 4 hops and learns more slowly
+  than DG; G RoPE does best on 4 hops in distribution (57%) but fails past 2K like
+  every RoPE model.
+- **Hybrids keep their direct multi-hop answers at length.** DG and DDDG lose little from
+  2K to 16K (4-hop 96 -> 90, 83 -> 81); LLLG loses more on 4 hops (79 -> 47).
+- Instability: DG direct seed 0 at 8000 steps learned nothing, not even 1 hop (17%
+  overall); seed 1 was at 99 / 56 / 49% on 1-3 hops and rising.
+- Caveats: the 24000-step runs are one seed each, and the cosine schedule stretches
+  with the step count (so the learning rate stays high longer, not only more steps).
+  Pure D is weaker on 1-hop in this mix (79% direct vs 100% in E2's needle task).
+
+For the real model: real text rarely spells out intermediate steps, so the direct format
+is the relevant one for multi-hop recall inside a forward pass. That argues against 1:7;
+1:3 with the global layer last is the compromise (1:1 is better and costs more).
 
 ## RoPE extension on the G-rope checkpoint (2026-10-01)
 

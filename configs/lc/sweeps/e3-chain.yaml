@@ -12,6 +12,11 @@ axes:
     GD: [model.layer_pattern=GD, model.attention.global_rope=none]
     DDDG: [model.layer_pattern=DDDG, model.attention.global_rope=none]
     D: [model.layer_pattern=D]
+    # E4's best placement (NoPE global layer last) at 1:1 / 1:3 / 1:7: does the ratio matter once lookups chain?
+    DG: [model.layer_pattern=DG, model.attention.global_rope=none]
+    DDDDDDDG: [model.layer_pattern=DDDDDDDG, model.attention.global_rope=none]
+    LLLG_nope: [model.layer_pattern=LLLG, model.attention.global_rope=none]
+    LLLLLLLG_nope: [model.layer_pattern=LLLLLLLG, model.attention.global_rope=none]
   format:
     direct: [task.cot=false]
     cot: [task.cot=true]

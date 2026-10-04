@@ -1,0 +1,16 @@
+# E3 follow-up: in e3-chain (8000 steps) every hybrid answered only 1-hop queries directly,
+# but some direct runs were still improving at the end (DG seed 1, G_nope seed 1). Train
+# direct answers 3x longer to separate "cannot" from "not learned yet".
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/e3b-long.yaml --report --at 2048
+name: e3b-long
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [steps=24000, task.cot=false, seed=0]
+axes:
+  arch:
+    G_rope: [model.layer_pattern=G, model.attention.global_rope=all]
+    G_nope: [model.layer_pattern=G, model.attention.global_rope=none]
+    DG: [model.layer_pattern=DG, model.attention.global_rope=none]
+    DDDG: [model.layer_pattern=DDDG, model.attention.global_rope=none]
+    DDDDDDDG: [model.layer_pattern=DDDDDDDG, model.attention.global_rope=none]
+    LLLG_nope: [model.layer_pattern=LLLG, model.attention.global_rope=none]
