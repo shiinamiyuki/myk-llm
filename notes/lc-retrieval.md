@@ -399,6 +399,34 @@ For the real model: real text rarely spells out intermediate steps, so the direc
 is the relevant one for multi-hop recall inside a forward pass. That argues against 1:7;
 1:3 with the global layer last is the compromise (1:1 is better and costs more).
 
+## KDA vs Gated DeltaNet in DDDG (2026-10-04)
+
+`configs/lc/sweeps/kda-vs-gdn.yaml`: DDDG with NoPE global layers, the linear layers
+either Gated DeltaNet (GDN, one decay per head) or Kimi Delta Attention (KDA, Kimi Linear:
+one decay per key channel, low-rank decay and output-gate projections;
+`model.deltanet.kind=kda`). Same size (8.8M non-embedding parameters), 8000 steps, 2 seeds,
+on needle (E2), chain with direct answers (E3) and capacity (128 records in 2K).
+
+| task | GDN | KDA |
+|---|---|---|
+| needle, 16K / 32K / 64K | 100 / 100 / 100 | 100 / 99 / 97 (seeds 95, 100 at 64K) |
+| chain direct, h = 1 / 2 / 3 / 4 at 2K | 100 / 14 / 16 / 15 | 100 / 83 / 79 / 70 (s0 100 / 100 / 97 / 95, s1 99 / 66 / 61 / 45) |
+| chain direct, same at 16K | 100 / 17 / 17 / 17 | 100 / 77 / 69 / 59 |
+| capacity, 512-16K | 100 | 100 |
+| train time per run | 8.1 min | 9.8 min (0.91M vs 1.12M tokens/s) |
+
+- **KDA learns direct multi-hop far sooner.** KDA seed 0 reached >= 90% on all hop
+  counts at 4500 steps; seed 1 was at 67% overall and rising. GDN stayed at 1 hop in
+  8000 steps (and needed 21500 steps in e3b-long, ending at 97 / 90 / 83). Its multi-hop
+  answers hold to 16K on seed 0 (99 / 94 / 80 on 2 / 3 / 4 hops).
+- Needle and capacity at this load: both saturate; KDA is slightly below GDN at 32K-64K
+  on the needle (one seed 95% at 64K). This capacity setting is too easy for DDDG (the
+  global layers alone can hold 128 records); it does not separate the two.
+- Cost: ~20% slower training here (fla kernels, small model; not a statement about large
+  scale).
+- Not separated: which part of KDA does it (per-channel decay vs low-rank gates vs a
+  different init). 2 seeds, 8000 steps only.
+
 ## RoPE extension on the G-rope checkpoint (2026-10-01)
 
 The calibration G-rope model (8 global layers, RoPE base 1e6 on all, trained on <= 2048

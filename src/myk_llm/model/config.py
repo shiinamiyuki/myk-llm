@@ -33,6 +33,9 @@ class AttentionConfig:
 
 @dataclass
 class DeltaNetConfig:
+    # "gdn": Gated DeltaNet (scalar decay per head); "kda": Kimi Delta Attention (Kimi
+    # Linear; per-channel decay, low-rank decay / output-gate projections, always gated).
+    kind: Literal["gdn", "kda"] = "gdn"
     num_heads: int = 8
     head_dim: int = 128
     expand_v: float = 1.0
@@ -40,7 +43,7 @@ class DeltaNetConfig:
     # Causal depthwise convolution on q/k/v before the delta rule. Its kernel sees
     # relative offsets directly, so it is also a source of positional information.
     use_short_conv: bool = True
-    use_gate: bool = True
+    use_gate: bool = True  # output gate (gdn only; kda always has one)
 
 
 @dataclass

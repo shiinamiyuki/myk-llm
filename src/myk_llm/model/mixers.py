@@ -128,7 +128,8 @@ class _FlaLayerState:
 
 
 class DeltaNet(nn.Module):
-    """Gated DeltaNet linear attention (Yang et al., 2024) from flash-linear-attention."""
+    """Gated DeltaNet linear attention (Yang et al., 2024) or Kimi Delta Attention (Kimi
+    Linear, 2025; `deltanet.kind`) from flash-linear-attention."""
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -136,21 +137,24 @@ class DeltaNet(nn.Module):
         # RTX 5090 (fla 0.5.1, tilelang); fall back to its Triton kernels unless set.
         os.environ.setdefault("FLA_TILELANG", "0")
         try:
-            from fla.layers import GatedDeltaNet
+            from fla.layers import GatedDeltaNet, KimiDeltaAttention
         except ImportError as error:  # pragma: no cover - optional dependency
             raise ImportError("'D' layers need flash-linear-attention: pip install flash-linear-attention") from error
         cfg = config.deltanet
-        self.inner = GatedDeltaNet(
+        common = dict(
             hidden_size=config.hidden_size,
             expand_v=cfg.expand_v,
             head_dim=cfg.head_dim,
             num_heads=cfg.num_heads,
-            use_gate=cfg.use_gate,
             use_short_conv=cfg.use_short_conv,
             conv_size=cfg.conv_size,
             layer_idx=0,  # each layer owns its own single-entry state object
             mode="chunk",
         )
+        if cfg.kind == "kda":
+            self.inner = KimiDeltaAttention(**common)
+        else:
+            self.inner = GatedDeltaNet(use_gate=cfg.use_gate, **common)
 
     def residual_projections(self) -> list[nn.Linear]:
         return [self.inner.o_proj]

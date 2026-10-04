@@ -1,0 +1,18 @@
+# DDDG (NoPE global layers) with Gated DeltaNet vs Kimi Delta Attention (KDA: per-channel
+# decay instead of one scalar per head) as the linear layers, on the three retrieval tasks:
+# needle (E2), multi-hop chains answered directly (E3; GDN learned only 1 hop in 8000 steps)
+# and capacity (128 records in 2K, E1's regime).
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/kda-vs-gdn.yaml --report --at 2048
+name: kda-vs-gdn
+configs:
+  needle: configs/lc/needle.yaml
+  chain: configs/lc/chain.yaml
+  capacity: configs/lc/capacity.yaml
+overrides: [model.layer_pattern=DDDG, model.attention.global_rope=none, task.cot=false]
+axes:
+  kind:
+    gdn: [model.deltanet.kind=gdn]
+    kda: [model.deltanet.kind=kda]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]
