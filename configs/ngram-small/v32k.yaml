@@ -1,0 +1,15 @@
+# 32K vocabulary; 3210 steps = 3000 x 1.07 (tokens per byte relative to 64K, measured
+# on the en / zh corpora), so every vocabulary trains on the same amount of text.
+base: base.yaml
+steps: 3210
+model:
+  vocab_size: 32768
+data:
+  tokenizer: _download_models/Qwen3.5-0.8B-pruned32k
+  sources:
+    - {name: en, weight: 0.4, path: data/shards-small/32k/fineweb-edu-en/train}
+    - {name: zh, weight: 0.6, path: data/shards-small/32k/fineweb-edu-zh/train}
+eval:
+  val_sets:
+    - {name: en, sources: [{name: en, path: data/shards-small/32k/fineweb-edu-en/val}]}
+    - {name: zh, sources: [{name: zh, path: data/shards-small/32k/fineweb-edu-zh/val}]}

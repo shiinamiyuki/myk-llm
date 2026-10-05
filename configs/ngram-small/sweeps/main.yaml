@@ -1,0 +1,16 @@
+# Vocabulary x hashed n-gram embeddings (2- and 3-grams, 2 x 65536 x 128 table rows = 16.8M
+# sparse parameters, about 0.7x the model body) injected at block 0 (added to the token
+# embedding) or block 1 (after one attention layer), or both.
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/main.yaml
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/main.yaml --report
+name: ngram-main
+configs:
+  v64k: configs/ngram-small/v64k.yaml
+  v32k: configs/ngram-small/v32k.yaml
+  v16k: configs/ngram-small/v16k.yaml
+axes:
+  ngram:
+    none: []
+    L0: ["model.ngram.orders=[2,3]", model.ngram.num_buckets=65536, model.ngram.dim=128, "model.ngram.layers=[0]"]
+    L1: ["model.ngram.orders=[2,3]", model.ngram.num_buckets=65536, model.ngram.dim=128, "model.ngram.layers=[1]"]
+    L01: ["model.ngram.orders=[2,3]", model.ngram.num_buckets=65536, model.ngram.dim=128, "model.ngram.layers=[0,1]"]

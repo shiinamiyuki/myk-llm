@@ -1,0 +1,12 @@
+# N-gram table size at 32K vocabulary, injected at block 1: 2 x {64K, 256K, 1M, 4M} rows x 128
+# (16.8M / 67M / 268M / 1.07B sparse parameters; 64K rows is main.yaml's v32k-L1).
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/tables.yaml
+name: ngram-tables
+configs:
+  v32k: configs/ngram-small/v32k.yaml
+overrides: ["model.ngram.orders=[2,3]", model.ngram.dim=128, "model.ngram.layers=[1]"]
+axes:
+  buckets:
+    b256k: [model.ngram.num_buckets=262144]
+    b1m: [model.ngram.num_buckets=1048576]
+    b4m: [model.ngram.num_buckets=4194304]

@@ -1,0 +1,12 @@
+# The large n-gram table (2 x 1M rows x 128, 268M sparse parameters, block 1) on the 64K and
+# 16K vocabularies too (32K is in tables.yaml): does the table close the vocab gap, or does
+# 64K keep its lead with the same table?
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/tables-vocab.yaml
+name: ngram-tables
+configs:
+  v64k: configs/ngram-small/v64k.yaml
+  v16k: configs/ngram-small/v16k.yaml
+overrides: ["model.ngram.orders=[2,3]", model.ngram.dim=128, "model.ngram.layers=[1]"]
+axes:
+  buckets:
+    b1m: [model.ngram.num_buckets=1048576]

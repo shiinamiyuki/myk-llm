@@ -214,6 +214,12 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
     sums: dict[str, float] = {}
     step_tokens_total = 0.0
 
+    def run_validation(step: int) -> None:
+        record = validate(model, objective, val_sets, token_bytes, info)
+        if metrics is not None:
+            metrics.log(step, record)
+        log0(info, f"step {step:6d} [val] " + " ".join(f"{k}={v:.4f}" for k, v in record.items()))
+
     for step in range(start_step, config.steps + 1):
         set_lr(optimizers, base_lrs, lr_multiplier(step, config.steps, config.schedule))
         micro_batches = [next(data_iter) for _ in range(grad_accum)]
@@ -255,11 +261,8 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
                        f"mem {record['perf/peak_mem_gb']:.1f}GB")
             window_start, window_tokens, sums, step_tokens_total = time.perf_counter(), 0, {}, 0.0
 
-        if val_sets and step % config.eval.interval == 0:
-            record = validate(model, objective, val_sets, token_bytes, info)
-            if metrics is not None:
-                metrics.log(step, record)
-            log0(info, f"step {step:6d} [val] " + " ".join(f"{k}={v:.4f}" for k, v in record.items()))
+        if val_sets and (step % config.eval.interval == 0 or step == config.steps):
+            run_validation(step)
 
         if config.eval.sample_interval and step % config.eval.sample_interval == 0:
             for text in sample_text(model, tokenizer, config, info):
@@ -276,6 +279,8 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
                 prune_checkpoints(run_dir, config.checkpoint.keep_last, config.checkpoint.keep_every)
             log0(info, f"saved {target}")
 
+    if val_sets and start_step > config.steps:  # resumed a finished run: validate its final checkpoint
+        run_validation(config.steps)
     if metrics is not None:
         metrics.close()
     loader.close()

@@ -1,0 +1,25 @@
+# Small-scale vocab / n-gram study (notes/ngram-small.md): a ~24M non-embedding model
+# (hidden 512, 8 layers, the 200M recipe's GL pattern) trained from scratch on ~400M
+# tokens of FineWeb-Edu en + zh, ~10 min per run on one RTX 5090. The v64k / v32k / v16k
+# configs set the tokenizer, its shards and a step count that keeps the training *bytes*
+# equal across vocabularies (smaller vocabularies need more tokens for the same text).
+# Compare runs by val bits-per-byte. Build the shards with scripts/pretokenize.py into
+# data/shards-small/<vocab>/fineweb-edu-{en,zh} (see the note).
+base: ../pretrain/base.yaml
+output_dir: runs/ngram-small
+global_batch_size: 64           # x 2048 = 131K tokens per step
+model:
+  hidden_size: 512
+  num_layers: 8
+  layer_pattern: GL
+  max_seq_len: 2048
+  attention: {num_heads: 8, num_kv_heads: 2, head_dim: 64, sliding_window: 512, global_rope: first}
+data:
+  micro_batch_size: 32
+schedule: {kind: wsd, warmup_ratio: 0.02, decay_ratio: 0.2}
+init: {embedding_from: "", embedding_row_map: ""}   # hidden 512 cannot take Qwen's 1024-wide rows
+checkpoint: {interval: 0, keep_last: 1, export_weights: false}
+eval:
+  interval: 250
+  batches: 8
+  sample_interval: 0

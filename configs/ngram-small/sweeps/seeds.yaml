@@ -1,0 +1,14 @@
+# Second seed for the main grid's key cells (same sweep directory as main.yaml, so the
+# report averages them with the seed-0 runs).
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/seeds.yaml
+name: ngram-main
+configs:
+  v64k: configs/ngram-small/v64k.yaml
+  v32k: configs/ngram-small/v32k.yaml
+  v16k: configs/ngram-small/v16k.yaml
+axes:
+  ngram:
+    none: []
+    L1: ["model.ngram.orders=[2,3]", model.ngram.num_buckets=65536, model.ngram.dim=128, "model.ngram.layers=[1]"]
+  seed:
+    s1: [seed=1]
