@@ -1,0 +1,13 @@
+# Multi-token prediction (3 MTP depths, loss weight 0.3 each) on every vocabulary, to
+# measure draft acceptance per vocabulary (scripts/eval_mtp_acceptance.py) and MTP's
+# effect on the main model's bpb. Weights are exported for the acceptance evaluation.
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/mtp.yaml
+name: ngram-mtp
+configs:
+  v64k: configs/ngram-small/v64k.yaml
+  v32k: configs/ngram-small/v32k.yaml
+  v16k: configs/ngram-small/v16k.yaml
+overrides: [model.mtp.depth=3, checkpoint.export_weights=true]
+axes:
+  ngram:
+    none: []

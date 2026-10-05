@@ -1,7 +1,7 @@
 # Small vocabulary + hashed n-gram embeddings — small-scale study
 
 Status (2026-10-05): main grid, second seeds, table-size scan and large tables on every
-vocabulary done (below). MTP acceptance per vocabulary not measured yet.
+vocabulary done; MTP acceptance per vocabulary measured (below).
 
 Question: can a smaller vocabulary plus hashed n-gram input embeddings (`model.ngram`)
 match a large vocabulary? Motivation: a smaller output head decodes faster, and the n-gram
@@ -112,14 +112,58 @@ ms per iteration at batch 1: 64K 0.489 (K=0) / 1.008 (K=3); 32K 0.444 / 0.747; 1
 - **With MTP the head runs 2K + 1 times per iteration** (K + 1 verified positions, K
   drafts), so a smaller vocabulary pays off: 32K is 20-26% faster than 64K at K = 3.
   64K at a = 0.9 is still slower than 32K at a = 0.8.
-- **16K never beats 32K at equal acceptance** (2-4% slower); it would need a slightly
-  higher acceptance rate, which shorter tokens may well give. Acceptance per vocabulary
-  is not measured yet (would need MTP-trained models).
+- **16K never beats 32K at equal acceptance** (2-4% slower); it would need a higher
+  acceptance rate. Measured below: it does not get one.
 - **The n-gram lookup costs 8% latency at batch 1, 4% at batch 32** in the current
   unfused form (hashing, two gathers, projection as separate small kernels); the table
   size itself does not matter. A fused kernel should make it nearly free.
 - The 30M small model is launch-bound (0.4-0.5 ms per step whatever the vocabulary), so
   its decode numbers say nothing about vocabulary.
+
+## MTP acceptance per vocabulary
+
+`configs/ngram-small/sweeps/mtp.yaml`: the three vocabularies (no n-grams) trained with 3
+MTP depths (loss weight 0.3 each), then `scripts/eval_mtp_acceptance.py` (full output:
+`runs/ngram-mtp-acceptance.txt`). Acceptance with greedy verification: draft k at
+position i is accepted when drafts 1..k all equal the main model's greedy token at
+their positions. Measured teacher-forced on 64 validation rows (130K positions) per
+language; on the model's own greedy continuations the acceptance is ~0.9 for every
+vocabulary, but 87-91% of their 4-grams are repeats (a 30M model loops), so that
+number is not used.
+
+Chained acceptance a_k on validation text, en / zh:
+
+| vocab | a_1 | a_2 | a_3 | tokens per iteration, K = 3 (0.4 en + 0.6 zh) | sampling (T = 1) a_1 |
+|---|---|---|---|---|---|
+| 64K | 0.690 / 0.623 | 0.472 / 0.389 | 0.322 / 0.243 | 2.347 | 0.30 / 0.30 |
+| 32K | 0.685 / 0.630 | 0.467 / 0.395 | 0.318 / 0.249 | 2.352 | 0.32 / 0.31 |
+| 16K | 0.691 / 0.628 | 0.477 / 0.396 | 0.330 / 0.252 | 2.365 | 0.35 / 0.33 |
+
+- **Per-token acceptance does not depend on the vocabulary** (tokens per iteration within
+  1%), so shorter tokens do not make drafting easier, and a 64K token carries 7% / 18%
+  more text than a 32K / 16K one. (Sampling acceptance is slightly higher for smaller
+  vocabularies, but low for all at this model size.)
+- MTP training also improved the main model: bpb 1.2021 / 1.2159 / 1.2374 for 64K / 32K /
+  16K, vs 1.2088 / 1.2215 / 1.2404 without (one seed; 0.003-0.007 better). Training is
+  2.6x slower at 64K (129K tok/s; three extra blocks and three output heads), 2.3x at 32K
+  (195K), 2.0x at 16K (263K).
+
+Decode speed at 200M with the measured acceptance (tokens per iteration x bytes per token
+/ the compiled 200M iteration times above), KB/s:
+
+| | K = 0 | K = 1 | K = 2 | K = 3 | best |
+|---|---|---|---|---|---|
+| 64K, batch 1 | 9.4 | 11.3 | 11.3 | 10.7 | 11.3 |
+| 32K, batch 1 | 9.6 | 12.7 | **13.6** | 13.4 | **13.6 (+20%)** |
+| 16K, batch 1 | 9.2 | 12.3 | 13.3 | 13.2 | 13.3 (+18%) |
+| 64K, batch 32 | 175 | 186 | 197 | 185 | 197 |
+| 32K, batch 32 | 179 | 193 | **208** | 204 | **208 (+5%)** |
+| 16K, batch 32 | 169 | 184 | 202 | 201 | 202 (+3%) |
+
+With this (low, small-model) acceptance, K = 2 is best for every vocabulary and 32K is
+20% faster than 64K at batch 1, 5% at batch 32. A stronger model accepts more drafts
+(the a = 0.8-0.9 columns of the earlier table), which favours larger K and so the
+smaller head even more.
 
 ## Reading for the real model
 
@@ -127,9 +171,11 @@ At equal table size 64K is slightly better per byte (0.004 bpb at 1M rows, ~4x t
 spread), while 32K trains ~20% faster per byte here and, with MTP speculative decoding,
 decodes 20-26% faster. Since the table is free at inference and costs only optimizer
 memory and time in training, the practical trade is "32K + a larger table" vs "64K":
-here 32K + 4M rows beats 64K + 1M rows. 16K is dominated by 32K: worse quality and no
-speed gain at equal acceptance. To decide for 200M / 600M: measure MTP acceptance per
-vocabulary, and check the quality gap at 200M (the vocabulary is a smaller share there).
+here 32K + 4M rows beats 64K + 1M rows. MTP acceptance per token is the same for every
+vocabulary, so with MTP drafting 32K decodes ~20% faster than 64K at batch 1. 16K is
+dominated by 32K: worse quality, no higher acceptance, no speed gain. Open for 200M /
+600M: the quality gap at 200M (the vocabulary is a smaller share there), and acceptance
+of a stronger model.
 
 ## Caveats
 
