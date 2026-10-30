@@ -18,8 +18,8 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from flash_attn import flash_attn_func, flash_attn_varlen_func
 
+from ..ops.flash_attn import flash_attn_func, flash_attn_varlen_func
 from .config import DELTANET, GLOBAL_ATTENTION, LOCAL_ATTENTION, ModelConfig
 from .layers import RMSNorm, RotaryEmbedding
 
@@ -39,7 +39,7 @@ class KVCache:
 
 
 class Attention(nn.Module):
-    """Grouped-query softmax attention via FlashAttention, global or sliding-window."""
+    """Grouped-query softmax attention via our Triton FlashAttention, global or sliding-window."""
 
     def __init__(self, config: ModelConfig, local: bool, use_rope: bool) -> None:
         super().__init__()

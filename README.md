@@ -9,6 +9,7 @@ src/myk_llm/
   model/             config, embeddings (token + hashed n-gram), mixers (attention / Gated DeltaNet),
                      layers (norm, SwiGLU, RoPE, residual gates), transformer (+ MTP), generation, io
   ops/fused_ce.py    fused linear + cross-entropy (+ z-loss) Triton kernel
+  ops/flash_attn.py  FlashAttention forward/backward Triton kernels (varlen, sliding window, GQA, KV cache)
   data/              pre-tokenized shards, streaming, SFT packing, document filter
   train/             trainer loop, FSDP2 setup, Muon/AdamW, schedules, objectives, DCP checkpoints
   eval/              zero-shot benchmarks, chat sanity eval

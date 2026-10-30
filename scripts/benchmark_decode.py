@@ -23,11 +23,11 @@ from __future__ import annotations
 import argparse
 
 import torch
-from flash_attn import flash_attn_with_kvcache
 
 from myk_llm.configuration import load_config
 from myk_llm.model import MykLLM
 from myk_llm.model.mixers import Attention
+from myk_llm.ops.flash_attn import flash_attn_with_kvcache
 from myk_llm.train.config import TrainConfig
 
 _eager_attention = Attention.forward
