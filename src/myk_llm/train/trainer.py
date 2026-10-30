@@ -163,7 +163,7 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
 
     model = MykLLM(config.model).to(info.device)
     initialize_weights(model, config.init)
-    log0(info, f"model: {model.num_parameters() / 1e6:.1f}M params ({model.num_parameters(exclude_embeddings=True) / 1e6:.1f}M non-embedding), layers {''.join(config.model.layer_types)}")
+    log0(info, f"model: {model.num_parameters() / 1e6:.1f}M params ({model.num_parameters(exclude_embeddings=True) / 1e6:.1f}M non-embedding), layers {config.model.layout}")
     model = parallelize(model, config.parallel, info)
     optimizers = build_optimizers(model, config.optimizer)
     base_lrs = [[g["lr"] for g in opt.param_groups] for opt in optimizers]

@@ -121,3 +121,28 @@ def test_scoring_marks_exactly_the_queries_with_a_wrong_answer_token():
     start, end = examples[1].answers[2]
     wrong = {(1, end - 2), (0, 5)}  # last answer token of row 1's third query; a context position
     assert score_batch(Oracle(wrong), examples) == [True] * 5 + [False]
+
+
+def test_evaluation_can_draw_other_hop_counts():
+    from myk_llm.lc.eval import evaluate
+
+    task = TaskConfig(num_records=8, num_queries=4, hops=[1, 2])
+    result = evaluate(Oracle(set()), task, [512], queries=40, seed=0, hops=[5, 6])
+    assert set(result["hops"][512]) == {5, 6} and result["accuracy"][512] == 1.0
+
+
+def test_report_tabulates_final_scans(tmp_path):
+    import json
+
+    from myk_llm.lc.sweep import report
+
+    for seed, six_hops in ((0, 0.5), (1, 0.7)):
+        run = f"chain-loop-s{seed}"
+        result = {
+            "run_name": run, "train_len": 2048, "train_minutes": 1.0,
+            "accuracy": {"2048": 1.0}, "depth": {"2048": [1.0]}, "hops": {"2048": {"1": 1.0}},
+            "scan": [{"iterations": 8, "accuracy": {"2048": 0.8}, "hops": {"2048": {"1": 1.0, "6": six_hops}}}],
+        }
+        (tmp_path / run).mkdir()
+        (tmp_path / run / "results.json").write_text(json.dumps(result))
+    assert "| chain-loop | 8 | 2 | 100 | 60 |" in report(tmp_path, at=2048)

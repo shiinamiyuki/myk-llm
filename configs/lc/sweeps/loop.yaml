@@ -1,0 +1,26 @@
+# Looped transformer on multi-hop chains with direct answers (notes/loop.md). The looped
+# models run a 2-block core, D then a NoPE G (global layer last, as in E4), r times
+# with shared weights; unlooped DG stacks match either their compute (8 layers = core x 4)
+# or their parameters (2 layers). Axes: injection (add / concat) x iteration count
+# (fixed 4 / drawn from 2-6 per step). Trained on 1-4 hops; the final scan evaluates
+# 1-8 hops at test-time iteration counts 1-16.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/loop.yaml --report --at 2048
+name: loop
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [steps=16000, task.cot=false, model.layer_pattern=DG, model.attention.global_rope=none,
+            "task.eval_hops=[1, 2, 3, 4, 5, 6, 8]", "scan_lengths=[2048, 8192]"]
+axes:
+  arch:
+    DG8: []
+    DG2: [model.num_layers=2]
+    add4: [model.num_layers=2, model.loop.core=2, model.loop.iterations=4, "eval_iterations=[1, 2, 4, 6, 8, 12, 16]"]
+    add2to6: [model.num_layers=2, model.loop.core=2, model.loop.iterations=4, "model.loop.train_iterations=[2, 6]",
+              "eval_iterations=[1, 2, 4, 6, 8, 12, 16]"]
+    concat4: [model.num_layers=2, model.loop.core=2, model.loop.iterations=4, model.loop.injection=concat,
+              "eval_iterations=[1, 2, 4, 6, 8, 12, 16]"]
+    concat2to6: [model.num_layers=2, model.loop.core=2, model.loop.iterations=4, model.loop.injection=concat,
+                 "model.loop.train_iterations=[2, 6]", "eval_iterations=[1, 2, 4, 6, 8, 12, 16]"]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]

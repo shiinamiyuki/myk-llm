@@ -1,5 +1,7 @@
 """The MykLLM decoder: embeddings -> blocks -> final norm, plus optional MTP modules.
 
+With `loop.core` set, the blocks are prelude -> core (looped, shared weights) -> coda.
+
 The model returns hidden states, not a loss. Objectives (cross entropy, z-loss,
 multi-token prediction, distillation) live in `myk_llm.train.objectives` and use
 `output_weight` directly, so the full (tokens, vocab) logits never need to exist.
@@ -7,6 +9,7 @@ multi-token prediction, distillation) live in `myk_llm.train.objectives` and use
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -81,6 +84,23 @@ class MTPModule(nn.Module):
         return x
 
 
+class Injection(nn.Module):
+    """Starts each loop iteration by combining the loop state with the core's input."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.kind = config.loop.injection
+        if self.kind == "concat":
+            self.state_norm = RMSNorm(config.hidden_size, config.norm_eps)
+            self.input_norm = RMSNorm(config.hidden_size, config.norm_eps)
+            self.proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+
+    def forward(self, state: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+        if self.kind == "add":
+            return state + inputs
+        return self.proj(torch.cat([self.state_norm(state), self.input_norm(inputs)], dim=-1))
+
+
 @dataclass
 class ModelOutput:
     hidden: torch.Tensor  # final-normed hidden states, ready for the output head
@@ -114,6 +134,10 @@ class MykLLM(nn.Module):
         if config.tie_embeddings:
             self.lm_head.weight = self.embed.token.weight
         self.mtp = nn.ModuleList(MTPModule(config) for _ in range(config.mtp.depth))
+        self.injection = Injection(config) if config.loop.core else None
+        # Training draws iteration counts from its own generator, seeded like the model
+        # init, so that every FSDP rank runs the same blocks in the same order.
+        self._iteration_rng = random.Random(torch.initial_seed())
         self.init_weights()
 
     # -- initialization ---------------------------------------------------------------
@@ -121,7 +145,7 @@ class MykLLM(nn.Module):
     def init_weights(self) -> None:
         std = self.config.initializer_range
         self.apply(lambda module: init_linear_(module, std))
-        scale = residual_init_scale(self.config.num_layers)
+        scale = residual_init_scale(self.config.effective_layers)
         for block in self.blocks:
             for proj in block.residual_projections():
                 proj.weight.mul_(scale)
@@ -169,6 +193,7 @@ class MykLLM(nn.Module):
         prefix_ids: torch.Tensor | None = None,
         head: Callable[["MykLLM", ModelOutput], Any] | None = None,
         embed_offset: torch.Tensor | None = None,
+        iterations: int | None = None,
     ) -> Any:
         """`seqlens` enables document masking (training); `cache`/`use_cache` drive
         incremental decoding; `prefix_ids` are the tokens preceding `input_ids`
@@ -176,6 +201,10 @@ class MykLLM(nn.Module):
 
         `embed_offset` (batch, seq_len, hidden) is added to the input embeddings (e.g. a
         task-specific positional signal computed outside the model).
+
+        `iterations` sets the core iteration count of a looped model (test-time depth;
+        default: see `num_iterations`). Every block call keeps its own cache entry, so a
+        cache only fits passes with the iteration count it was built with.
 
         Returns a ModelOutput, or `head(self, output)` when `head` is given. Losses run
         as a head so that they execute inside forward: under FSDP (fully sharded data
@@ -192,16 +221,65 @@ class MykLLM(nn.Module):
         x, ngram_updates = self.embed(input_ids, prefix_ids)
         if embed_offset is not None:
             x = x + embed_offset
-        states = cache if cache is not None else [None] * len(self.layers)
+        loop = self.config.loop
+        iterations = self.num_iterations(iterations)
+        num_calls = len(self.layers) + loop.core * (iterations - 1)
+        if cache is not None and len(cache) != num_calls:
+            raise ValueError(f"cache has {len(cache)} entries but this pass runs {num_calls} blocks (iteration count changed?)")
+        states = iter(cache if cache is not None else [None] * num_calls)
         new_cache: list[Any] | None = [] if use_cache else None
-        for index, (block, state) in enumerate(zip(self.layers, states)):
-            if index in ngram_updates:
-                x = x + ngram_updates[index]
-            x, state = block(x, position_ids, varlen, state, use_cache)
+
+        def run(index: int, x: torch.Tensor) -> torch.Tensor:
+            x, state = self.layers[index](x, position_ids, varlen, next(states), use_cache)
             if new_cache is not None:
                 new_cache.append(state)
+            return x
+
+        def enter(index: int, x: torch.Tensor) -> torch.Tensor:
+            return x + ngram_updates[index] if index in ngram_updates else x
+
+        core_start = loop.prelude if loop.core else len(self.layers)
+        for index in range(core_start):
+            x = run(index, enter(index, x))
+        if loop.core:
+            x = self._run_core(enter(core_start, x), run, iterations)
+        for index in range(core_start + loop.core, len(self.layers)):
+            x = run(index, enter(index, x))
         output = ModelOutput(self.final_norm(x), x, position_ids, varlen, new_cache)
         return head(self, output) if head is not None else output
+
+    def num_iterations(self, iterations: int | None = None) -> int:
+        """Core iterations of one pass: `iterations` if given, else a draw from
+        loop.train_iterations in training mode, else loop.iterations."""
+        loop = self.config.loop
+        if not loop.core:
+            if iterations is not None:
+                raise ValueError("iterations needs a looped model (model.loop.core > 0)")
+            return 1
+        if iterations is not None:
+            if iterations < 1:
+                raise ValueError(f"iterations must be >= 1, got {iterations}")
+            return iterations
+        if self.training and loop.train_iterations:
+            return self._iteration_rng.randint(*loop.train_iterations)
+        return loop.iterations
+
+    def _run_core(self, inputs: torch.Tensor, run: Callable[[int, torch.Tensor], torch.Tensor], iterations: int) -> torch.Tensor:
+        """The core blocks, `iterations` times over a loop state that starts at zero and
+        takes in `inputs` at the start of every iteration. With truncated backpropagation
+        the earlier iterations run without autograd (gradients still reach `inputs`
+        through the later ones)."""
+        loop, injection = self.config.loop, self.injection
+        assert injection is not None
+        grad = torch.is_grad_enabled()
+        first_tracked = iterations - loop.backprop_iterations if grad and loop.backprop_iterations else 0
+        state = torch.zeros_like(inputs)
+        for iteration in range(iterations):
+            with torch.set_grad_enabled(grad and iteration >= first_tracked):
+                state = injection(state, inputs)
+                for index in range(loop.prelude, loop.prelude + loop.core):
+                    state = run(index, state)
+        return state
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)

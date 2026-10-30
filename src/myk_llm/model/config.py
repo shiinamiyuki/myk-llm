@@ -97,6 +97,33 @@ class MTPConfig:
 
 
 @dataclass
+class LoopConfig:
+    """Looped (recurrent-depth) transformer: the `core` blocks after the first `prelude`
+    blocks share their weights across `iterations` passes, then the remaining blocks
+    (the coda) run once. Layer types still come from `layer_pattern` over the
+    num_layers distinct blocks.
+
+    The loop state starts at zero; every iteration first injects the core's input (the
+    stream after the prelude) into it:
+      add:    state + input (Yang et al., 2024; with one iteration this is exactly the
+              unlooped model)
+      concat: Linear([norm(state), norm(input)]) (Geiping et al., 2025)
+
+    Training can draw the iteration count per step, uniformly from `train_iterations`,
+    and backpropagate through only the last `backprop_iterations` of them (truncated
+    backpropagation through time (BPTT)). Evaluation uses `iterations` unless forward
+    is given a count (test-time depth).
+    """
+
+    core: int = 0  # blocks in the shared core; 0 disables looping
+    prelude: int = 0
+    iterations: int = 1  # default count; the residual init is scaled for this depth
+    train_iterations: list[int] = field(default_factory=list)  # [min, max]; empty: always `iterations`
+    backprop_iterations: int = 0  # 0: through every iteration
+    injection: Literal["add", "concat"] = "add"
+
+
+@dataclass
 class ModelConfig:
     vocab_size: int = 65536
     hidden_size: int = 1024
@@ -112,6 +139,7 @@ class ModelConfig:
     residual: ResidualConfig = field(default_factory=ResidualConfig)
     ngram: NgramEmbeddingConfig = field(default_factory=NgramEmbeddingConfig)
     mtp: MTPConfig = field(default_factory=MTPConfig)
+    loop: LoopConfig = field(default_factory=LoopConfig)
 
     def __post_init__(self) -> None:
         if not self.layer_pattern or set(self.layer_pattern) - set(LAYER_CODES):
@@ -127,10 +155,36 @@ class ModelConfig:
                 raise ValueError(f"ngram.layers must be distinct block indices in [0, {self.num_layers}), got {layers}")
         if self.mtp.layer not in LAYER_CODES:
             raise ValueError(f"mtp.layer must be one of {LAYER_CODES}")
+        loop = self.loop
+        if loop.core < 0 or loop.prelude < 0 or loop.prelude + loop.core > self.num_layers:
+            raise ValueError(f"need loop.core, loop.prelude >= 0 and prelude + core <= num_layers ({self.num_layers})")
+        if loop.core:
+            if loop.iterations < 1 or loop.backprop_iterations < 0:
+                raise ValueError("need loop.iterations >= 1 and loop.backprop_iterations >= 0")
+            if loop.train_iterations and (len(loop.train_iterations) != 2 or not 1 <= loop.train_iterations[0] <= loop.train_iterations[1]):
+                raise ValueError(f"loop.train_iterations must be [min, max] with 1 <= min <= max, got {loop.train_iterations}")
+            # A core block after the first runs on the loop state, which has no single
+            # "input" to add the update to; the first block's update joins the injected input.
+            if self.ngram.orders and any(loop.prelude < i < loop.prelude + loop.core for i in self.ngram.layers):
+                raise ValueError("ngram.layers cannot point inside the loop core (except at its first block)")
 
     @property
     def layer_types(self) -> list[str]:
         return [self.layer_pattern[i % len(self.layer_pattern)] for i in range(self.num_layers)]
+
+    @property
+    def effective_layers(self) -> int:
+        """Blocks run per forward pass at the default iteration count."""
+        return self.num_layers + self.loop.core * (self.loop.iterations - 1)
+
+    @property
+    def layout(self) -> str:
+        """Layer types with the loop marked, e.g. "D(GD)x4G": prelude D, core GD run 4 times, coda G."""
+        types, loop = "".join(self.layer_types), self.loop
+        if not loop.core:
+            return types
+        end = loop.prelude + loop.core
+        return f"{types[: loop.prelude]}({types[loop.prelude : end]})x{loop.iterations}{types[end:]}"
 
     @property
     def ffn_hidden_size(self) -> int:

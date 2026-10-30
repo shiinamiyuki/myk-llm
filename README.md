@@ -7,7 +7,7 @@ experiments, trained with PyTorch FSDP2 (fully sharded data parallel) on one GPU
 src/myk_llm/
   configuration.py   YAML -> typed dataclass configs (`base:` inheritance, key=value overrides)
   model/             config, embeddings (token + hashed n-gram), mixers (attention / Gated DeltaNet),
-                     layers (norm, SwiGLU, RoPE, residual gates), transformer (+ MTP), generation, io
+                     layers (norm, SwiGLU, RoPE, residual gates), transformer (+ MTP, looped core), generation, io
   ops/fused_ce.py    fused linear + cross-entropy (+ z-loss) Triton kernel
   ops/flash_attn.py  FlashAttention forward/backward Triton kernels (varlen, sliding window, GQA, KV cache)
   data/              pre-tokenized shards, streaming, SFT packing, document filter

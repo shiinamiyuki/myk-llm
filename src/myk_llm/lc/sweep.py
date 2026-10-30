@@ -8,7 +8,8 @@ Same sweep files and resume behavior as `myk_llm.arith.sweep` (see there):
 The report averages runs that differ only in their trailing `-s<k>` seed label.
 `eff@90` / `eff@50` is the longest context length up to which every evaluated length
 stays at >= 90% / >= 50% accuracy (0 if the shortest already fails). `--at L` adds
-accuracy per needle-depth bucket and per hop count at length L.
+accuracy per needle-depth bucket and per hop count at length L, and the final scans
+(hop extrapolation, core iteration counts of looped models) at L.
 """
 
 from __future__ import annotations
@@ -72,7 +73,32 @@ def report(sweep_dir: Path, metric: str = "accuracy", at: int | None = None) -> 
         lines += [row for _, row in sorted(rows)]
         if at is not None:
             lines += _detail(configs, at)
+            lines += _scan(configs, at)
     return "\n".join(lines)
+
+
+def _scan(configs: dict[str, list[dict]], length: int) -> list[str]:
+    """Accuracy per hop count in the final scans (lc.train `eval_iterations` /
+    `task.eval_hops`) at `length`: one row per run and core iteration count."""
+    key = str(length)
+    cells: dict[tuple[str, int | None], list[dict[str, float]]] = {}
+    for name, runs in configs.items():
+        for r in runs:
+            for scan in r.get("scan", []):
+                if key in scan["hops"]:
+                    cells.setdefault((name, scan["iterations"]), []).append(scan["hops"][key])
+    if not cells:
+        return []
+    hops = sorted({h for runs in cells.values() for r in runs for h in r}, key=int)
+    lines = [
+        f"\nFinal scan at {_k(length)}: accuracy by hop count per core iteration count (- = the model's default)\n",
+        "| run | iterations | seeds | " + " | ".join(f"{h} hops" for h in hops) + " |",
+        "|---|---|---|" + "---|" * len(hops),
+    ]
+    for (name, iterations), runs in sorted(cells.items(), key=lambda item: (item[0][0], item[0][1] or 0)):
+        row = [f"{100 * np.mean([r.get(h, np.nan) for r in runs]):.0f}" for h in hops]
+        lines.append(f"| {name} | {iterations or '-'} | {len(runs)} | " + " | ".join(row) + " |")
+    return lines
 
 
 def _detail(configs: dict[str, list[dict]], length: int) -> list[str]:

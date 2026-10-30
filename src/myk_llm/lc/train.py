@@ -46,6 +46,12 @@ class LcConfig:
     eval_interval: int = 1000
     eval_queries: int = 200  # per length, during training
     final_eval_queries: int = 1000  # per length, at the end
+    # Final scan, run when task.eval_hops or eval_iterations is set: the final checkpoint
+    # on hop counts task.eval_hops (empty: task.hops) at `scan_lengths` (empty:
+    # task.eval_lengths), once per core iteration count in `eval_iterations` (looped
+    # models: test-time depth; must be empty otherwise) or once at the model's own depth.
+    eval_iterations: list[int] = field(default_factory=list)
+    scan_lengths: list[int] = field(default_factory=list)
 
 
 def late_mean(late: list[tuple[int, dict[int, float]]], learned_step: int | None, lengths: list[int]) -> dict:
@@ -86,7 +92,7 @@ def train(config: LcConfig) -> dict:
         values = [a for length, a in accuracy.items() if length <= task.max_len]
         return float(np.mean(values)) if values else float("nan")
     params = model.num_parameters(exclude_embeddings=True)
-    print(f"[{config.run_name}] {params / 1e6:.2f}M non-embedding params, layers {''.join(config.model.layer_types)}, "
+    print(f"[{config.run_name}] {params / 1e6:.2f}M non-embedding params, layers {config.model.layout}, "
           f"{config.batch_rows}x{task.max_len} tokens/step, {config.steps} steps", flush=True)
 
     def log_eval(step: int, result: dict, prefix: str) -> None:
@@ -130,6 +136,14 @@ def train(config: LcConfig) -> dict:
     torch.save({"config": dump_yaml(config), "state_dict": model.state_dict()}, run_dir / "model.pt")
     final = evaluate(model, task, lengths, config.final_eval_queries, seed=12345)
     log_eval(config.steps, final, "final_")
+    scans = []
+    if task.eval_hops or config.eval_iterations:
+        for iterations in config.eval_iterations or [None]:
+            scan = evaluate(model, task, config.scan_lengths or lengths, config.final_eval_queries, seed=12345,
+                            iterations=iterations, hops=task.eval_hops or None)
+            scans.append({"iterations": iterations, "accuracy": scan["accuracy"], "hops": scan["hops"]})
+            print(f"[{config.run_name}] scan, iterations {iterations or 'default'}: "
+                  + " ".join(f"{length}:{a:.2f}" for length, a in scan["accuracy"].items()), flush=True)
     metrics.close()
     if learned_step is None and in_distribution(final["accuracy"]) >= 0.9:
         learned_step = config.steps
@@ -142,6 +156,7 @@ def train(config: LcConfig) -> dict:
         "accuracy_late": late_mean(late, learned_step, lengths),
         "in_distribution": in_distribution(final["accuracy"]),
         "learned_step": learned_step,  # first evaluation at >= 90% in distribution (None: never)
+        "scan": scans,  # [{"iterations": count or None (default), "accuracy": ..., "hops": ...}]
         "non_embedding_params": params,
         "train_minutes": (time.perf_counter() - started) / 60,
     }
