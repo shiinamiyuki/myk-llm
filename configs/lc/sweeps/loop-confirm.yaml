@@ -1,0 +1,24 @@
+# Follow-up of loop.yaml (notes/loop.md): does the 2-block looped core trained with a
+# random iteration count (2-6 per step) match the 8-layer DG stack on 1-4 hop chains?
+# Four seeds and 24000 steps instead of two and 16000; the looped models are evaluated
+# (during training, hence "learned", and in the main table) at r = 6, the top of their
+# training range, instead of their default 4. The models themselves are loop.yaml's
+# (residual init still scaled for r = 4). The final scan adds r = 3 and 5.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/loop-confirm.yaml --report --at 2048
+name: loop-confirm
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [steps=24000, task.cot=false, model.layer_pattern=DG, model.attention.global_rope=none,
+            "task.eval_hops=[1, 2, 3, 4, 5, 6, 8]", "scan_lengths=[2048, 8192]"]
+axes:
+  arch:
+    DG8: []
+    add2to6: [model.num_layers=2, model.loop.core=2, model.loop.iterations=4, "model.loop.train_iterations=[2, 6]",
+              eval_iterations=6, "scan_iterations=[1, 2, 3, 4, 5, 6, 8, 12, 16]"]
+    concat2to6: [model.num_layers=2, model.loop.core=2, model.loop.iterations=4, model.loop.injection=concat,
+                 "model.loop.train_iterations=[2, 6]", eval_iterations=6, "scan_iterations=[1, 2, 3, 4, 5, 6, 8, 12, 16]"]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]
+    s2: [seed=2]
+    s3: [seed=3]

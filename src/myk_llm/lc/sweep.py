@@ -78,7 +78,7 @@ def report(sweep_dir: Path, metric: str = "accuracy", at: int | None = None) -> 
 
 
 def _scan(configs: dict[str, list[dict]], length: int) -> list[str]:
-    """Accuracy per hop count in the final scans (lc.train `eval_iterations` /
+    """Accuracy per hop count in the final scans (lc.train `scan_iterations` /
     `task.eval_hops`) at `length`: one row per run and core iteration count."""
     key = str(length)
     cells: dict[tuple[str, int | None], list[dict[str, float]]] = {}

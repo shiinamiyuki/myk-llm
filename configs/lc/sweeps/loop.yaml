@@ -14,13 +14,13 @@ axes:
   arch:
     DG8: []
     DG2: [model.num_layers=2]
-    add4: [model.num_layers=2, model.loop.core=2, model.loop.iterations=4, "eval_iterations=[1, 2, 4, 6, 8, 12, 16]"]
+    add4: [model.num_layers=2, model.loop.core=2, model.loop.iterations=4, "scan_iterations=[1, 2, 4, 6, 8, 12, 16]"]
     add2to6: [model.num_layers=2, model.loop.core=2, model.loop.iterations=4, "model.loop.train_iterations=[2, 6]",
-              "eval_iterations=[1, 2, 4, 6, 8, 12, 16]"]
+              "scan_iterations=[1, 2, 4, 6, 8, 12, 16]"]
     concat4: [model.num_layers=2, model.loop.core=2, model.loop.iterations=4, model.loop.injection=concat,
-              "eval_iterations=[1, 2, 4, 6, 8, 12, 16]"]
+              "scan_iterations=[1, 2, 4, 6, 8, 12, 16]"]
     concat2to6: [model.num_layers=2, model.loop.core=2, model.loop.iterations=4, model.loop.injection=concat,
-                 "model.loop.train_iterations=[2, 6]", "eval_iterations=[1, 2, 4, 6, 8, 12, 16]"]
+                 "model.loop.train_iterations=[2, 6]", "scan_iterations=[1, 2, 4, 6, 8, 12, 16]"]
   seed:
     s0: [seed=0]
     s1: [seed=1]

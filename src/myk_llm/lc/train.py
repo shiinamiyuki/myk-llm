@@ -46,11 +46,15 @@ class LcConfig:
     eval_interval: int = 1000
     eval_queries: int = 200  # per length, during training
     final_eval_queries: int = 1000  # per length, at the end
-    # Final scan, run when task.eval_hops or eval_iterations is set: the final checkpoint
+    # Core iteration count of the evaluations during training and of the final one
+    # (looped models only; 0: model.loop.iterations). A model trained on a range of
+    # counts may need the top of the range for its hardest chains.
+    eval_iterations: int = 0
+    # Final scan, run when task.eval_hops or scan_iterations is set: the final checkpoint
     # on hop counts task.eval_hops (empty: task.hops) at `scan_lengths` (empty:
-    # task.eval_lengths), once per core iteration count in `eval_iterations` (looped
+    # task.eval_lengths), once per core iteration count in `scan_iterations` (looped
     # models: test-time depth; must be empty otherwise) or once at the model's own depth.
-    eval_iterations: list[int] = field(default_factory=list)
+    scan_iterations: list[int] = field(default_factory=list)
     scan_lengths: list[int] = field(default_factory=list)
 
 
@@ -70,6 +74,8 @@ def train(config: LcConfig) -> dict:
         raise ValueError(f"model.vocab_size must be >= {VOCAB_SIZE}")
     if max(task.eval_lengths + [task.max_len]) > config.model.max_seq_len:
         raise ValueError("model.max_seq_len must cover the longest evaluation length (RoPE tables)")
+    if (config.eval_iterations or config.scan_iterations) and not config.model.loop.core:
+        raise ValueError("eval_iterations / scan_iterations need a looped model (model.loop.core > 0)")
     run_dir = Path(config.output_dir) / config.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "config.yaml").write_text(dump_yaml(config), encoding="utf-8")
@@ -83,6 +89,7 @@ def train(config: LcConfig) -> dict:
     loader = iter(build_loader(task, config.batch_rows, config.seed, config.num_workers))
     metrics = MetricsLogger(run_dir / "metrics.jsonl")
     lengths = task.eval_lengths
+    eval_iterations = config.eval_iterations or None
     late: list[tuple[int, dict[int, float]]] = []  # (step, accuracy) of second-half evaluations
     # Retrieval appears abruptly after a plateau whose length varies with seed and
     # architecture; record when it happened so a late transition is not read as inability.
@@ -124,7 +131,7 @@ def train(config: LcConfig) -> dict:
             loss_sum = token_sum = 0.0
             window_start = time.perf_counter()
         if config.eval_interval and step % config.eval_interval == 0 and step != config.steps:
-            result = evaluate(model, task, lengths, config.eval_queries, seed=step)
+            result = evaluate(model, task, lengths, config.eval_queries, seed=step, iterations=eval_iterations)
             log_eval(step, result, "")
             if learned_step is None and in_distribution(result["accuracy"]) >= 0.9:
                 learned_step = step
@@ -134,11 +141,11 @@ def train(config: LcConfig) -> dict:
 
     # Save before the (slower) final evaluation so an interrupted eval can be redone.
     torch.save({"config": dump_yaml(config), "state_dict": model.state_dict()}, run_dir / "model.pt")
-    final = evaluate(model, task, lengths, config.final_eval_queries, seed=12345)
+    final = evaluate(model, task, lengths, config.final_eval_queries, seed=12345, iterations=eval_iterations)
     log_eval(config.steps, final, "final_")
     scans = []
-    if task.eval_hops or config.eval_iterations:
-        for iterations in config.eval_iterations or [None]:
+    if task.eval_hops or config.scan_iterations:
+        for iterations in config.scan_iterations or [None]:
             scan = evaluate(model, task, config.scan_lengths or lengths, config.final_eval_queries, seed=12345,
                             iterations=iterations, hops=task.eval_hops or None)
             scans.append({"iterations": iterations, "accuracy": scan["accuracy"], "hops": scan["hops"]})

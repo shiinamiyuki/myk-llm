@@ -1,6 +1,7 @@
 # Looped transformer
 
-Status (2026-10-30): implemented (`model.loop`); first sweep (lc chains, 2 seeds) done.
+Status (2026-10-31): implemented (`model.loop`); first sweep (lc chains, 2 seeds) and a
+4-seed follow-up done.
 
 Question: can a few blocks with shared weights, run several times (recurrent depth),
 replace a deeper stack on tasks that need serial depth, and can they then trade compute
@@ -42,9 +43,11 @@ y = coda(s)                          # the remaining blocks, run once
 ## Testbed additions (lc)
 
 - `task.eval_hops`: hop counts of a final scan (e.g. 1-8 after training on 1-4).
-- `eval_iterations`, `scan_lengths` (LcConfig): the final checkpoint is evaluated once
+- `scan_iterations`, `scan_lengths` (LcConfig): the final checkpoint is evaluated once
   per test-time iteration count; `results.json["scan"]`, tabulated by
   `python -m myk_llm.lc.sweep ... --report --at L`.
+- `eval_iterations` (LcConfig): iteration count of the in-training and final
+  evaluations (hence of "learned" and the main table) without changing the model.
 
 ## First sweep: multi-hop chains (2026-10-30)
 
@@ -109,12 +112,81 @@ Readings (2 seeds; seed spread is as large as most differences):
   Iterations beyond the trained range never help; accuracy declines slowly from r = 8.
 - **The default depth underestimates random-r models**: evaluation (in training and
   the main table) runs at loop.iterations = 4, the middle of the range, while add2to6
-  s1 needs r = 6 for 4 hops. Evaluate them at the top of the training range.
+  s1 needs r = 6 for 4 hops. Evaluate them at the top of the training range. (Only at
+  16000 steps: after 24000, r = 4 is enough for 1-4 hops; see the follow-up.)
 - Length: looped models keep their accuracy to 8K like DG8 (NoPE global layer last).
 - add vs concat: no clear winner. concat with random r is the only variant that does
   anything at r = 1 (58-73% on 1 hop) and keeps 1 hop at ~100% for every r >= 2.
 
-Next: more seeds and steps for DG8 vs add2to6 / concat2to6, evaluated at r = 6; a wider
-r range (2-10) with truncated backpropagation to see whether hops keep following
-iterations; training on 1-6 hops to test whether extrapolation needs harder training
-chains or an adaptive halting signal.
+## Follow-up: 4 seeds, 24000 steps (2026-10-31)
+
+`configs/lc/sweeps/loop-confirm.yaml`: DG8 vs add2to6 / concat2to6 as above, 4 seeds,
+24000 steps; the looped models (unchanged) are evaluated at r = 6 during training and in
+the main table (`eval_iterations`), and the scan adds r = 3 and 5. ~21-25 min per run;
+training throughput DG8 1.24M tokens/s, add 1.29M, concat 1.11M (the concat adapter
+costs ~15% at this size). Full tables: `runs/lc/loop-confirm/summary.md`.
+
+Final accuracy at 2K per hop count (1 / 2 / 3 / 4), looped models at r = 6:
+
+| arch | seed 0 | seed 1 | seed 2 | seed 3 | learned |
+|---|---|---|---|---|---|
+| DG8 | 100 / 94 / 95 / 87 | 100 / 97 / 97 / 90 | 100 / 96 / 94 / 88 | 100 / 77 / 68 / 73 | 11500, 10500, 9000, - |
+| add2to6 | 100 / 97 / 96 / 90 | 100 / 98 / 97 / 94 | 99 / 88 / 44 / 15 | 100 / 95 / 94 / 86 | 10500, 9000, -, 17500 |
+| concat2to6 | 100 / 94 / 91 / 88 | 100 / 99 / 97 / 94 | 100 / 79 / 68 / 64 | 100 / 92 / 92 / 88 | 11000, 14000, -, 13500 |
+
+Mean over all 4 seeds, all queries at 2K: DG8 91, add2to6 87, concat2to6 90 (8K: 90 /
+87 / 90; accuracy_late 88 / 83 / 87).
+
+Final scan at 2K, mean of 4 seeds (r = 5 and 8 are within 2 points of r = 6). The scan
+contexts also hold 5-8-hop chains, so 1-4 hops score a few points below the table above:
+
+| arch | r | 1 | 2 | 3 | 4 | 5 | 6 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| DG8 | - | 100 | 87 | 88 | 81 | 31 | 21 | 20 |
+| add2to6 | 1 | 3 | 0 | 0 | 0 | 0 | 0 | 0 |
+| add2to6 | 2 | 99 | 63 | 34 | 16 | 18 | 20 | 20 |
+| add2to6 | 3 | 98 | 90 | 74 | 41 | 20 | 19 | 20 |
+| add2to6 | 4 | 98 | 89 | 77 | 67 | 38 | 26 | 23 |
+| add2to6 | 6 | 99 | 88 | 77 | 69 | 48 | 29 | 23 |
+| add2to6 | 12 | 91 | 83 | 74 | 65 | 47 | 28 | 21 |
+| add2to6 | 16 | 69 | 66 | 63 | 53 | 38 | 23 | 17 |
+| concat2to6 | 1 | 27 | 1 | 1 | 1 | 1 | 0 | 1 |
+| concat2to6 | 2 | 98 | 83 | 41 | 21 | 20 | 15 | 19 |
+| concat2to6 | 3 | 98 | 86 | 76 | 35 | 23 | 21 | 20 |
+| concat2to6 | 4 | 98 | 85 | 75 | 67 | 24 | 21 | 18 |
+| concat2to6 | 6 | 98 | 84 | 74 | 67 | 28 | 21 | 19 |
+| concat2to6 | 12 | 96 | 76 | 67 | 60 | 25 | 22 | 19 |
+| concat2to6 | 16 | 94 | 69 | 59 | 52 | 26 | 22 | 20 |
+
+Readings:
+- **Confirmed: the 2-block looped core matches DG8 at a quarter of the parameters.**
+  Every architecture learns in 3 of 4 seeds, at similar steps (DG8 9000-11500, add
+  9000-17500, concat 11000-14000), and the learned seeds reach the same accuracy (4
+  hops: DG8 87-90, add 86-94, concat 88-94). The one unlearned seed per architecture
+  was still at 57-78% and mostly rising at 24000 steps; seeds differ more than
+  architectures do. The match also holds at DG8's compute: the learned looped seeds at
+  r = 4 are within 3 points of r = 6 on 1-4 hops.
+- **One iteration per hop**: h hops need r >= h, and more iterations add nothing on
+  the trained hops. Per seed the steps are sharp, e.g. concat s0 / s3 on 3 hops 25-29%
+  at r = 2 -> 88% at r = 3, on 4 hops 19-20% at r = 3 -> 79-84% at r = 4; add s0 on 3
+  hops 57 -> 91 (r = 2 -> 3), on 4 hops 69 -> 86 (r = 3 -> 4). Each iteration is one
+  D + one G layer, and DG8 (4 G layers) handles 4 hops: one global-attention pass per
+  hop, as E3 suggested. (concat s1 is the exception: 3 hops at 77% already at r = 2.)
+  The first sweep's r = 4 deficit (add2to6 s1: 4 hops 16% at r = 4) was undertraining;
+  the same seed is at 89% after 24000 steps.
+- **add extrapolates past the trained hops with extra iterations; concat does not.**
+  add s1 / s3 answer 5 hops at 72-76% from r = 5 (s1: 42% at r = 4 -> 71 at r = 5 ->
+  76 at r = 6), s3 also 6 hops at ~50% and 8 hops at 30-33% (chance ~20%), stable up
+  to r = 12; DG8's best seed reaches 43% on 5 hops. Only 2 of the 3 learned add seeds
+  do it (s0 stays at chance). concat s0 / s3 are at chance on 5 hops for every r, and
+  concat s1's ~50% does not grow with r. The add loop seems to learn a reusable hop
+  step; concat something tied to the trained depth.
+- **Too many iterations**: r <= 8 is safe; add loses 1 hop from r = 12 (91%, 69% at
+  r = 16); concat keeps 1 hop (94% at r = 16) but loses ~15 points on 2-4 hops.
+- 8K stays within ~5 points of 2K for every architecture.
+
+Next: hop extrapolation with add injection: train on 1-4 hops with r drawn from a
+wider range (2-10, truncated backpropagation to bound the cost) to see whether 6-8 hops
+follow more iterations, and train on 1-6 hops to see how far past the trained hops
+the step carries; an adaptive halting signal only once r demonstrably tracks the hop
+count beyond training.
