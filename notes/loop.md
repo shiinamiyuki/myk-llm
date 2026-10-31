@@ -1,7 +1,7 @@
 # Looped transformer
 
-Status (2026-10-31): implemented (`model.loop`); first sweep (lc chains, 2 seeds) and a
-4-seed follow-up done.
+Status (2026-10-31): implemented (`model.loop`); first sweep (lc chains, 2 seeds), a
+4-seed follow-up and a hop-extrapolation sweep done.
 
 Question: can a few blocks with shared weights, run several times (recurrent depth),
 replace a deeper stack on tasks that need serial depth, and can they then trade compute
@@ -185,8 +185,78 @@ Readings:
   r = 16); concat keeps 1 hop (94% at r = 16) but loses ~15 points on 2-4 hops.
 - 8K stays within ~5 points of 2K for every architecture.
 
-Next: hop extrapolation with add injection: train on 1-4 hops with r drawn from a
-wider range (2-10, truncated backpropagation to bound the cost) to see whether 6-8 hops
-follow more iterations, and train on 1-6 hops to see how far past the trained hops
-the step carries; an adaptive halting signal only once r demonstrably tracks the hop
-count beyond training.
+## Hop extrapolation: wider r range, truncated BPTT, longer chains (2026-10-31)
+
+`configs/lc/sweeps/loop-hops.yaml`: add injection, 2-block DG core, 24000 steps, 4
+seeds, evaluated at the top of each arm's r range. The final scan covers 1-12 hops
+(1-6, 8, 10, 12) at r = 1-24; its contexts hold more long chains than loop-confirm's,
+so r2to6 (loop-confirm's add2to6, same seeds) runs again to be scanned the same way.
+
+| arm | trained hops | train r | backprop | min / run | mean 2K | 1 / 2 / 3 / 4 hops | learned (s0-s3) |
+|---|---|---|---|---|---|---|---|
+| r2to6 | 1-4 | 2-6 | all | 21 | 80 | 99 / 77 / 74 / 70 | -, 11000, 18500, 19500 |
+| r2to10 | 1-4 | 2-10 | all | 31 | 96 | 99 / 96 / 97 / 94 | 13000, 18500, 11000, 7500 |
+| r2to10bp4 | 1-4 | 2-10 | last 4 | 24 | 77 | 97 / 81 / 70 / 62 | 20000, -, -, 19000 |
+| h6r2to10 | 1-6 (min_len 320) | 2-10 | all | 31 | 49 | 98 / 61 / 45 / 34 (5: 33, 6: 26) | -, -, -, - |
+
+Final scan at 2K, mean of 4 seeds; 10 and 12 hops are at chance (<= 22%) for every arm
+and r:
+
+| arm | r | 1 | 2 | 3 | 4 | 5 | 6 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| r2to6 | 3 | 99 | 73 | 44 | 17 | 18 | 17 | 14 |
+| r2to6 | 4 | 99 | 73 | 63 | 45 | 23 | 17 | 12 |
+| r2to6 | 6 | 98 | 70 | 62 | 56 | 32 | 23 | 12 |
+| r2to6 | 10 | 93 | 66 | 62 | 55 | 31 | 23 | 14 |
+| r2to6 | 16 | 53 | 41 | 40 | 35 | 23 | 15 | 9 |
+| r2to6 | 24 | 20 | 24 | 27 | 24 | 12 | 8 | 5 |
+| r2to10 | 3 | 99 | 93 | 45 | 19 | 14 | 15 | 17 |
+| r2to10 | 4 | 99 | 93 | 85 | 52 | 26 | 21 | 18 |
+| r2to10 | 6 | 99 | 91 | 86 | 76 | 46 | 30 | 15 |
+| r2to10 | 10 | 98 | 90 | 86 | 77 | 49 | 30 | 14 |
+| r2to10 | 16 | 98 | 90 | 84 | 77 | 46 | 30 | 15 |
+| r2to10 | 24 | 90 | 74 | 60 | 53 | 26 | 15 | 10 |
+| r2to10bp4 | 1 | 66 | 2 | 4 | 3 | 3 | 4 | 4 |
+| r2to10bp4 | 4 | 96 | 73 | 60 | 58 | 21 | 17 | 15 |
+| r2to10bp4 | 10 | 95 | 74 | 60 | 57 | 25 | 17 | 16 |
+| r2to10bp4 | 24 | 92 | 70 | 56 | 55 | 22 | 18 | 16 |
+| h6r2to10 | 4 | 99 | 60 | 42 | 22 | 15 | 17 | 16 |
+| h6r2to10 | 6 | 98 | 59 | 43 | 35 | 28 | 19 | 16 |
+| h6r2to10 | 10 | 98 | 57 | 44 | 36 | 28 | 24 | 16 |
+
+Readings:
+- **Seeds do not reproduce**: r2to6 trains exactly like loop-confirm's add2to6 with the
+  same seeds, yet s0 learned at 10500 there and never here, s2 the reverse. The losses
+  agree to 5 digits at step 200 and differ from step 500: nondeterministic GPU kernels,
+  amplified by the plateau before the transition. A seed label means nothing past a
+  few hundred steps; only rates and means over seeds count. Pooled, add2to6 / r2to6
+  learned in 5 of 8 runs.
+- **Training on r = 2-10 learns more reliably and better**: 4 of 4 seeds learned
+  (7500-18500), 90-98% on 4 hops, and the scan is ahead of r2to6 on every trained hop
+  count (4 hops at r = 6: 76 vs 56). Against r2to6's pooled 5 of 8 this is suggestive,
+  not significant, and r2to10 also spends 1.5x the compute per step (mean r 6 vs 4).
+  r2to10bp4 has r2to10's forward passes but is worse than r2to6, so the gain needs
+  gradients through the deeper iterations, not just the deeper forward passes.
+- **The usable test-time r grows with the trained range**: r2to10 holds every hop
+  count up to r = 16 and loses ~20-30 points at r = 24; r2to6 drops from r = 10-12 and
+  collapses at 16-24 (s3 at 0% from r = 16).
+- **Extrapolation still stops 1-2 hops past training**: r2to10 answers 5 hops at
+  46-49% and 6 hops at 30% from r = 6 (best seed s3: 73% and 42-48%, up from 36% and 23%
+  at r = 4), similar to r2to6 (s1: 61% / 41-44%). 8, 10 and 12 hops stay at chance for
+  every arm and every r up to 24. A wider iteration range does not extend the reach;
+  past r = 6-8 extra iterations add nothing.
+- **Truncated BPTT (last 4 of 2-10 iterations) hurts**: 2 of 4 seeds learned, late
+  (19000-20000); no 5-hop signal (~25%); it saves only a quarter of the time here (24
+  vs 31 min). Its r curve is the flattest (1 hop: 66% at r = 1, 92% at r = 24). Use full
+  backpropagation at this scale.
+- **Training on 1-6 hops did not learn in 24000 steps** (0 of 4 at 90%): the best seed
+  (s1) ends at 85 / 82 / 73 / 73 / 56 on 2-6 hops and was still rising (36% at step
+  15000, 78% at 21000); the others are at 30-52%, multi-hop partly or not learned. The
+  longer chains delay the multi-hop transition past the budget, so the arm cannot yet
+  say whether training on more hops extends the reach. (s1: 5 hops from r = 6, 6 hops
+  only at r >= 10 (20% at r = 6, 38% at 10), 8 hops at chance.)
+
+Next: the reach question needs the 1-6 hop arm to learn: more steps (48000) or a hop
+curriculum (1-4, then 1-6). With rates swinging between 2 and 4 of 4 seeds, headline
+comparisons need ~8 seeds. Adaptive halting is moot while extra iterations do not
+buy hops past training.
