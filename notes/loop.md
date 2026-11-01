@@ -1,7 +1,7 @@
 # Looped transformer
 
-Status (2026-10-31): implemented (`model.loop`); first sweep (lc chains, 2 seeds), a
-4-seed follow-up and a hop-extrapolation sweep done.
+Status (2026-11-01): implemented (`model.loop`); four lc chain sweeps done (first
+sweep, 4-seed follow-up, hop extrapolation, curriculum).
 
 Question: can a few blocks with shared weights, run several times (recurrent depth),
 replace a deeper stack on tasks that need serial depth, and can they then trade compute
@@ -9,6 +9,21 @@ for accuracy at test time by running more iterations? The lc chain task is the p
 E3 found that direct (no chain-of-thought (CoT)) multi-hop answers depend on the number
 of global layers (1:7 hybrids fail at 3-4 hops) and are learned late, i.e. hops cost
 depth.
+
+Summary so far (2-block D + NoPE G core, add injection unless noted):
+- The looped core matches the 8-layer stack (DG8) on 1-4 hops at a quarter of the
+  parameters and the same compute (loop-confirm).
+- Train with a random iteration count r per step, else r is not a test-time knob; a
+  wider range (2-10 vs 2-6) learns more reliably and stays usable to r = 16 (loop-hops).
+  Keep full backpropagation; truncating to the last 4 iterations hurts.
+- About one iteration per hop: h hops need r >= h (sometimes h - 1).
+- Extrapolation reaches 1-2 hops past the trained ones, relative to them: trained on
+  1-4 hops, 5 hops ~50% and 6 ~30%; continued on 1-6 hops, 7 hops ~60% and 8 ~43%;
+  further hops are at chance for every r. More training on the same hops does not
+  extend it (loop-curriculum). add extrapolates, concat injection does not.
+- Long chains need a curriculum: 1-6 hops from scratch did not learn in 24000 steps,
+  continuing a 1-4 hop model learned them in 3000-12500.
+- Same-seed reruns diverge (nondeterministic kernels): compare rates over seeds.
 
 ## Model (`ModelConfig.loop`)
 
@@ -256,7 +271,61 @@ Readings:
   say whether training on more hops extends the reach. (s1: 5 hops from r = 6, 6 hops
   only at r >= 10 (20% at r = 6, 38% at 10), 8 hops at chance.)
 
-Next: the reach question needs the 1-6 hop arm to learn: more steps (48000) or a hop
-curriculum (1-4, then 1-6). With rates swinging between 2 and 4 of 4 seeds, headline
-comparisons need ~8 seeds. Adaptive halting is moot while extra iterations do not
-buy hops past training.
+## Curriculum: continuing on 1-6 hops (2026-11-01)
+
+`configs/lc/sweeps/loop-curriculum.yaml`: each run continues the final loop-hops r2to10
+model of its seed (1-4 hops, r = 2-10; all 4 learned) for 16000 steps with a fresh
+optimizer and cosine schedule (`init_from`), on 1-6 hops (h6, min_len 320) or on 1-4
+hops again (h4, the control for the extra training); "start" rescans the starting
+checkpoints (steps=0). The scan adds 7 hops and r = 7. ~21 min per continued run.
+
+Final accuracy at 2K on the trained hops (r = 10): start 99 / 96 / 97 / 94; h4 100 / 98
+/ 98 / 97; h6 99 / 96 / 96 / 92 / 93 / 90 (1-6 hops). h6 crossed 90% in every seed, after
+3000-12500 steps (from scratch, 0 of 4 in 24000 steps); h4 within 500-2500.
+
+Final scan at 2K, mean of 4 seeds (r = 10 and 12 are within 2 points of r = 8; 10 and
+12 hops are at chance, <= 27%, everywhere):
+
+| arm | r | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|---|
+| start | 4 | 98 | 94 | 88 | 54 | 31 | 18 | 18 | 15 |
+| start | 6 | 97 | 94 | 90 | 81 | 52 | 26 | 18 | 17 |
+| start | 8 | 97 | 93 | 89 | 80 | 53 | 27 | 17 | 18 |
+| start | 24 | 90 | 78 | 63 | 50 | 26 | 16 | 7 | 9 |
+| h4 | 4 | 100 | 97 | 90 | 71 | 36 | 19 | 17 | 21 |
+| h4 | 6 | 100 | 96 | 91 | 87 | 53 | 28 | 16 | 20 |
+| h4 | 8 | 100 | 96 | 91 | 88 | 54 | 29 | 15 | 18 |
+| h4 | 24 | 71 | 39 | 31 | 26 | 8 | 6 | 4 | 5 |
+| h6 | 4 | 100 | 98 | 93 | 67 | 48 | 32 | 18 | 22 |
+| h6 | 5 | 99 | 97 | 93 | 90 | 76 | 54 | 33 | 26 |
+| h6 | 6 | 99 | 96 | 94 | 89 | 88 | 74 | 50 | 34 |
+| h6 | 7 | 100 | 95 | 93 | 90 | 89 | 82 | 58 | 42 |
+| h6 | 8 | 100 | 95 | 93 | 89 | 89 | 81 | 62 | 44 |
+| h6 | 16 | 95 | 91 | 90 | 85 | 86 | 76 | 55 | 38 |
+| h6 | 24 | 54 | 47 | 45 | 41 | 44 | 35 | 24 | 19 |
+
+Per seed (h6, r = 8; 7 / 8 hops): s0 69 / 49, s1 67 / 35, s2 29 / 23, s3 84 / 68. h4 is
+at chance on 7 hops in every seed.
+
+Readings:
+- **The reach is relative to the trained hops**: after 1-6 hops the model answers 7
+  hops at 62% and 8 at 44% (best seed 84 / 68), where the same model continued on 1-4
+  hops stays at chance from 7 hops and at the start's 53% / 28% on 5 / 6 hops. Training
+  longer chains moves the limit by the 2 hops added; extra training on the old ones
+  does not. 10 and 12 hops stay at chance, so the reach is still +1-2 hops, not a
+  general loop. The seed that extrapolated least before (s2: 5 hops 30%) also does
+  least after (7 hops 29%).
+- **Iterations still track hops**: in h6, 5 hops go 48 -> 76 -> 88 for r = 4 -> 5 -> 6,
+  6 hops 54 -> 74 -> 82 for r = 5 -> 6 -> 7, 7 hops 50 -> 58 -> 62 for r = 6 -> 7 -> 8; the
+  best seed (s3) does 7 hops at 75% already at r = 6 (one hop fewer than iterations).
+- **A curriculum is what makes 1-6 hops learnable here**: from the 1-4 hop model they
+  take 3000-12500 steps; from scratch 24000 steps were not enough (loop-hops).
+- **Continued training narrows the safe r range**: at r = 24, start keeps 90% on 1
+  hop, h4 71%, h6 54% (r <= 16 is fine for all). The fresh schedule's second warmup,
+  or simply more training at r <= 10, makes far-out iterations drift more.
+
+Next: whether the reach keeps growing with the curriculum (1-6 -> 1-8 -> ...) or
+saturates; an iterated-step objective (supervise the state after each iteration, e.g.
+the key reached so far) to turn the +1-2 hop reach into a general loop; ~8 seeds for
+headline claims. Adaptive halting becomes interesting once r reliably tracks hop counts
+past training.

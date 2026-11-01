@@ -1,0 +1,26 @@
+# Does the hop extrapolation of the add loop reach further when it is trained on longer
+# chains? (notes/loop.md, after loop-hops.yaml, whose 1-6 hop arm did not learn from
+# scratch in 24000 steps.) Curriculum by continuation: each run starts from the final
+# loop-hops r2to10 model of its seed (trained on 1-4 hops, r = 2-10; all four learned)
+# and trains 16000 more steps with a fresh optimizer and schedule, on 1-6 hops (h6) or,
+# as the control for the extra training, on 1-4 hops again (h4). "start" only rescans
+# the starting checkpoints. The scan adds 7 hops and r = 7 (+1 past the 1-6 training,
+# like 5 hops past 1-4); data seeds differ from the first stage.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/loop-curriculum.yaml --report --at 2048
+name: loop-curriculum
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [task.cot=false, model.layer_pattern=DG, model.attention.global_rope=none,
+            model.num_layers=2, model.loop.core=2, model.loop.iterations=6, "model.loop.train_iterations=[2, 10]",
+            eval_iterations=10, "task.eval_hops=[1, 2, 3, 4, 5, 6, 7, 8, 10, 12]", "scan_lengths=[2048, 8192]",
+            "scan_iterations=[1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 24]"]
+axes:
+  arch:
+    start: [steps=0]
+    h6: [steps=16000, "task.hops=[1, 2, 3, 4, 5, 6]", task.min_len=320]
+    h4: [steps=16000]
+  seed:
+    s0: [seed=10, init_from=runs/lc/loop-hops/chain-r2to10-s0/model.pt]
+    s1: [seed=11, init_from=runs/lc/loop-hops/chain-r2to10-s1/model.pt]
+    s2: [seed=12, init_from=runs/lc/loop-hops/chain-r2to10-s2/model.pt]
+    s3: [seed=13, init_from=runs/lc/loop-hops/chain-r2to10-s3/model.pt]

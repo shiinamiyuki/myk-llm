@@ -35,6 +35,10 @@ class LcConfig:
     seed: int = 0
     task: TaskConfig = field(default_factory=TaskConfig)
     model: ModelConfig = field(default_factory=ModelConfig)  # see configs/lc/base.yaml
+    # model.pt of an earlier run to continue from (e.g. a curriculum stage); the model
+    # config must match, the optimizer and schedule start fresh. With steps=0 the run
+    # only evaluates the checkpoint (e.g. a new scan).
+    init_from: str = ""
     steps: int = 5000
     batch_rows: int = 32  # rows of task.max_len tokens per step
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -81,6 +85,8 @@ def train(config: LcConfig) -> dict:
     (run_dir / "config.yaml").write_text(dump_yaml(config), encoding="utf-8")
 
     model = MykLLM(config.model).to(device)
+    if config.init_from:
+        model.load_state_dict(torch.load(config.init_from, map_location=device)["state_dict"])
     optimizers = build_optimizers(model, config.optimizer)
     base_lrs = [[g["lr"] for g in opt.param_groups] for opt in optimizers]
     if config.compile:
