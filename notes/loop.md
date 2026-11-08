@@ -1,7 +1,8 @@
 # Looped transformer
 
-Status (2026-11-01): implemented (`model.loop`); four lc chain sweeps done (first
-sweep, 4-seed follow-up, hop extrapolation, curriculum).
+Status (2026-11-08): implemented (`model.loop`); four lc chain sweeps done (first
+sweep, 4-seed follow-up, hop extrapolation, curriculum) and a zero-training early-exit
+analysis (`myk_llm.lc.halting`).
 
 Question: can a few blocks with shared weights, run several times (recurrent depth),
 replace a deeper stack on tasks that need serial depth, and can they then trade compute
@@ -24,6 +25,10 @@ Summary so far (2-block D + NoPE G core, add injection unless noted):
 - Long chains need a curriculum: 1-6 hops from scratch did not learn in 24000 steps,
   continuing a 1-4 hop model learned them in 3000-12500.
 - Same-seed reruns diverge (nondeterministic kernels): compare rates over seeds.
+- Early exit works without training on output signals, not on state convergence: the
+  loop state never reaches a fixed point, but the prediction settles one iteration
+  after the chain is resolved; exiting at confidence > 0.9 keeps the accuracy at about
+  half the iterations on the trained hops (per-query exits, context at full depth).
 
 ## Model (`ModelConfig.loop`)
 
@@ -327,5 +332,73 @@ Readings:
 Next: whether the reach keeps growing with the curriculum (1-6 -> 1-8 -> ...) or
 saturates; an iterated-step objective (supervise the state after each iteration, e.g.
 the key reached so far) to turn the +1-2 hop reach into a general loop; ~8 seeds for
-headline claims. Adaptive halting becomes interesting once r reliably tracks hop counts
-past training.
+headline claims.
+
+## Early exit without training (2026-11-08)
+
+The model always runs its full iteration budget (no halting). Does a convergence signal
+tell when a query is done? `python -m myk_llm.lc.halting <runs> --hops 1 2 3 4 5 6 7 8
+10` (`src/myk_llm/lc/halting.py`) runs each checkpoint once at 24 iterations and reads
+the prediction out after every iteration (final norm + head on the loop state; these
+models have no coda). Per query, over its answer positions: delta = relative change of
+the final-normed state (the add-injected state itself grows by the input every
+iteration), KL to the previous iteration's next-token distribution, confidence (the
+argmax probability), exact match. An exit rule stops a query at the first iteration
+>= 2 that passes its threshold, else at the budget (the top of the training range).
+Models: h6 (loop-curriculum, budget 10), start (= loop-hops r2to10, budget 10), r2to6
+(loop-hops, budget 6); 4 seeds x 2000 queries at 2K, pooled.
+
+h6, median per hop count (rows) after iteration t (columns), KL / delta:
+
+| hops | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 16 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 7 / 1.20 | 5e-4 / 0.45 | 2e-5 / 0.29 | 8e-6 / 0.21 | 4e-6 / 0.16 | 2e-6 / 0.11 | 2e-6 / 0.09 | 9e-7 / 0.08 | 2e-6 / 0.07 |
+| 2 | 7 / 1.21 | 2 / 0.58 | 6e-4 / 0.27 | 9e-5 / 0.21 | 3e-5 / 0.19 | 3e-5 / 0.12 | 3e-5 / 0.09 | 2e-5 / 0.08 | 4e-5 / 0.08 |
+| 3 | 7 / 1.21 | 0.3 / 0.56 | 0.4 / 0.42 | 6e-4 / 0.22 | 9e-5 / 0.20 | 5e-5 / 0.12 | 4e-5 / 0.09 | 4e-5 / 0.08 | 1e-4 / 0.08 |
+| 4 | 7 / 1.20 | 0.04 / 0.53 | 0.8 / 0.48 | 0.05 / 0.33 | 4e-4 / 0.21 | 1e-4 / 0.13 | 8e-5 / 0.11 | 8e-5 / 0.08 | 3e-4 / 0.08 |
+| 5 | 7 / 1.20 | 0.04 / 0.55 | 0.2 / 0.48 | 0.2 / 0.39 | 4e-3 / 0.26 | 2e-4 / 0.15 | 1e-4 / 0.11 | 7e-5 / 0.08 | 4e-4 / 0.08 |
+| 6 | 7 / 1.20 | 0.04 / 0.54 | 0.06 / 0.48 | 0.2 / 0.43 | 0.03 / 0.32 | 1e-3 / 0.20 | 3e-4 / 0.12 | 2e-4 / 0.08 | 7e-4 / 0.07 |
+| 8 | 7 / 1.20 | 0.04 / 0.54 | 0.05 / 0.48 | 0.09 / 0.43 | 0.07 / 0.34 | 0.02 / 0.25 | 3e-3 / 0.15 | 1e-3 / 0.09 | 4e-3 / 0.07 |
+
+Exit rules, accuracy % (mean iterations) on the trained hops and past them:
+
+| rule | h6: 1-6 hops | h6: 7-10 | start: 1-4 | start: 5-10 | r2to6: 1-4 | r2to6: 5-10 |
+|---|---|---|---|---|---|---|
+| fixed (budget) | 91.5 (10) | 46.7 (10) | 90.0 (10) | 27.3 (10) | 73.5 (6) | 22.4 (6) |
+| delta < 0.2 | 91.6 (6.4) | 47.3 (7.8) | 90.1 (5.6) | 26.6 (6.1) | 73.9 (4.7) | 22.2 (5.0) |
+| KL < 1e-2 | 89.0 (5.1) | 45.5 (7.2) | 89.5 (4.7) | 26.6 (6.6) | 73.5 (4.2) | 22.6 (5.2) |
+| KL < 1e-3 | 91.6 (6.0) | 46.9 (9.1) | 90.2 (5.6) | 27.3 (9.0) | 73.5 (4.8) | 22.6 (5.8) |
+| confidence > 0.9 | 91.4 (4.8) | 46.1 (8.5) | 90.1 (4.5) | 27.2 (8.7) | 73.6 (4.2) | 22.3 (5.8) |
+| confidence > 0.99 | 91.5 (5.8) | 46.7 (9.3) | 90.0 (5.5) | 27.3 (9.6) | 73.5 (4.5) | 22.4 (6.0) |
+
+h6 at confidence > 0.9, mean exit iteration per hop count 1-8: 2.2, 3.9, 4.7, 5.6, 6.0,
+6.6, 7.7, 8.6 (first correct iteration, counting lucky guesses: 2.0, 2.9, 3.5, 4.2,
+4.6, 5.2, 5.8, 6.7).
+
+Readings:
+- **The loop state does not converge**: delta decays like ~1/t for every query, solved
+  or not, to ~0.07 (r2to6: 0.10-0.15), and past t = 8 it is the same for 1 and 10 hops.
+  Thresholds below 0.1 never fire within the budget; delta < 0.2 saves iterations by
+  exiting everyone at about the same time (h6: 5.7 iterations for 1 hop, 7.9 for 10).
+- **The prediction converges one iteration after the chain is resolved**: KL to the
+  previous iteration drops by 2-3 orders of magnitude at t = h + 1 (1 hop at 3, 2 at 4,
+  ..., 6 at 8), the one-iteration-per-hop pattern seen inside a single pass. Later
+  iterations keep moving the state along directions the readout ignores.
+- **Output-signal exits keep the accuracy at about half the iterations**: on the
+  trained hops confidence > 0.9 matches the fixed budget (h6 91.4 vs 91.5%, start 90.1
+  vs 90.0%) at 4.8 / 4.5 of 10 iterations (52-55% saved; r2to6 31% of 6), and exits
+  scale with hop count, a median 0 (mean 1) iterations after the first correct one.
+  KL < 1e-3 is as accurate but waits ~1 iteration more; KL < 1e-2 starts losing (-2.5
+  points on h6).
+- **Unsolvable chains spend the budget**: past the reach the model is not confident
+  and runs to 8.5-9.6 of 10 iterations, which is where the remaining compute goes
+  (a rule cannot tell "not yet" from "never"). Since the output drifts again from r ~16
+  (r2to6: ~10), the budget should stay at the top of the training range.
+- Caveat: these are per-query exits with every context token at full depth. Prefill
+  compute is dominated by the context, so the saving applies to decoding, where an
+  exited token's keys / values for later iterations would have to be filled (e.g. with
+  its last iteration's, as Huginn does). Untested so far, as is exiting context tokens.
+
+Next for halting: per-token exit in decoding with that key / value fill, to check the
+accuracy holds; a learned halting head looks unnecessary on this task, since
+confidence already tracks the hop count.

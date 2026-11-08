@@ -146,3 +146,36 @@ def test_report_tabulates_final_scans(tmp_path):
         (tmp_path / run).mkdir()
         (tmp_path / run / "results.json").write_text(json.dumps(result))
     assert "| chain-loop | 8 | 2 | 100 | 60 |" in report(tmp_path, at=2048)
+
+
+def test_exit_rules_stop_at_the_first_passing_iteration_within_the_budget():
+    from myk_llm.lc.halting import exit_iterations
+
+    inf = float("inf")
+    delta = np.array([[inf, 0.5, 0.05, 0.01], [inf, 0.01, 0.5, 0.5], [inf, 0.5, 0.5, 0.5]])
+    assert exit_iterations(delta, "<", 0.1, budget=4).tolist() == [3, 2, 4]
+    assert exit_iterations(delta, "<", 0.02, budget=3).tolist() == [3, 2, 3]  # iteration 4 is past the budget
+    assert exit_iterations(1 - delta, ">", 0.9, budget=4).tolist() == [3, 2, 4]
+
+
+def test_trace_reads_the_model_out_after_every_iteration():
+    from conftest import requires_cuda, tiny_model_config
+    from myk_llm.lc.halting import trace
+    from myk_llm.model import MykLLM
+
+    if not torch.cuda.is_available():
+        pytest.skip(requires_cuda.kwargs["reason"])
+    torch.manual_seed(0)
+    model = MykLLM(tiny_model_config(num_layers=2, layer_pattern="G", **{"loop.core": 2, "loop.iterations": 3})).cuda().eval()
+    task = TaskConfig(num_records=4, num_queries=2, hops=[1, 2])
+    examples = [make_example(np.random.default_rng(i), task, 256) for i in range(3)]
+    traced = trace(model, examples, iterations=4)
+    assert traced["conf"].shape == (6, 4) and np.isinf(traced["delta"][:, 0]).all()
+    # Iteration t of a 4-iteration pass reads out exactly what a t-iteration pass returns.
+    ids = torch.from_numpy(np.stack([e.ids for e in examples])).cuda()
+    for t in (1, 2, 4):
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            hidden = model(ids, seqlens=[torch.tensor([256])] * 3, iterations=t).hidden
+        conf = [min(torch.softmax(model.logits(hidden[row, start - 1 : end - 1].float()).float(), -1).max(-1).values.tolist())
+                for row, e in enumerate(examples) for start, end in e.answers]
+        np.testing.assert_allclose(traced["conf"][:, t - 1], conf, rtol=1e-4)
