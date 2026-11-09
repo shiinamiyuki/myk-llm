@@ -114,6 +114,12 @@ class LoopConfig:
     and backpropagate through only the last `backprop_iterations` of them (truncated
     backpropagation through time (BPTT)). Evaluation uses `iterations` unless forward
     is given a count (test-time depth).
+
+    With a cross-decoder ("X" blocks, see CrossDecoderConfig) the core lies either in the
+    self-decoder or in the cross-decoder (prelude >= the first "X" block, e.g. LLLL(X)x4):
+    a looped cross-decoder re-queries the one shared KV every iteration, the input is the
+    self-decoder's output (after any cross-decoder blocks before the core), and since
+    cross-decoder blocks keep no state, the iteration count does not change the cache.
     """
 
     core: int = 0  # blocks in the shared core; 0 disables looping
@@ -183,8 +189,10 @@ class ModelConfig:
             if start == 0 or CROSS_ATTENTION in types[:start] or set(types[start:]) != {CROSS_ATTENTION}:
                 raise ValueError(f"cross-decoder ('X') blocks must be the last blocks after at least one other, "
                                  f"got {''.join(types)} (write the pattern out in full, e.g. LLLLXXXX)")
-            if self.loop.core:
-                raise ValueError("a cross-decoder cannot be combined with a looped core")
+            loop = self.loop
+            if loop.core and loop.prelude < start < loop.prelude + loop.core:
+                raise ValueError(f"the loop core (blocks {loop.prelude}-{loop.prelude + loop.core - 1}) must lie "
+                                 f"either before the cross-decoder or inside it (from block {start})")
             if self.cross.kv == "layer" and GLOBAL_ATTENTION not in types[:start]:
                 raise ValueError("cross.kv=layer needs a global ('G') layer in the self-decoder")
         loop = self.loop

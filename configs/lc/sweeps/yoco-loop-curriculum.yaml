@@ -1,0 +1,22 @@
+# Curriculum for the looped cross-decoder (notes/yoco.md E6), as loop-curriculum.yaml did
+# for the looped DG core: yoco-loop's h6r2to10 (1-6 hops from scratch) stayed at chance on
+# both seeds, so each run continues the final yoco-loop r2to10 model of its seed (1-4 hops,
+# r = 2-10) for 16000 steps with a fresh optimizer and schedule, on 1-6 hops (h6) or, as
+# the control for the extra training, on 1-4 hops again (h4). The scan adds 7 hops and
+# r = 7; data seeds differ from the first stage.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/yoco-loop-curriculum.yaml --report --at 2048
+name: yoco-loop-curriculum
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [task.cot=false, model.attention.global_rope=none,
+            model.layer_pattern=LLLLX, model.num_layers=5, model.loop.prelude=4, model.loop.core=1,
+            model.loop.iterations=6, "model.loop.train_iterations=[2, 10]", eval_iterations=10,
+            "task.eval_hops=[1, 2, 3, 4, 5, 6, 7, 8, 10, 12]", "scan_lengths=[2048, 8192]",
+            "scan_iterations=[1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 24]"]
+axes:
+  arch:
+    h6: [steps=16000, "task.hops=[1, 2, 3, 4, 5, 6]", task.min_len=320]
+    h4: [steps=16000]
+  seed:
+    s0: [seed=10, init_from=runs/lc/yoco-loop/chain-r2to10-s0/model.pt]
+    s1: [seed=11, init_from=runs/lc/yoco-loop/chain-r2to10-s1/model.pt]

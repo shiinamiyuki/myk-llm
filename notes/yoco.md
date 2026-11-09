@@ -1,6 +1,7 @@
 # Decoder-decoder (YOCO)
 
-Status (2026-11-08): implemented (`model.cross`, "X" blocks); E1-E5 done.
+Status (2026-11-09): implemented (`model.cross`, "X" blocks, looped cross-decoder);
+E1-E6 done; E6 follow-ups on 1-6 hop training running.
 
 Summary:
 - Quality: free at this scale. Single-hop retrieval is perfect to 64K (E1); multi-hop
@@ -12,8 +13,13 @@ Summary:
 - Inference: a quarter of the cache and a 4.6x faster 64K prefill for LLLLXXXX; decode
   per token is unchanged (each cross block still reads the full shared KV), and slower
   for GLGLXXXX, which has six full-context reads per token (E5).
-- Next: a looped cross-decoder (weight-shared "X" blocks iterated r times over the
-  shared KV) to set the hop reach at test time (E4).
+- A looped cross-decoder (one weight-shared "X" block iterated r times, `LLLL(X)xr`)
+  makes the hop reach a test-time knob: r iterations answer exactly r hops. It is the
+  best multi-hop model so far: 100% on 1-4 hops in all 4 runs, against 85% for LLLLXXXX
+  and 77% for the looped DG core of notes/loop.md at 4 hops. Past the 1-4 hop training
+  it answers 5 hops at 90-98% and 6 hops at 58-68%. Unlike the DG loop, a fixed r = 4
+  extrapolates as well as random r. 1-6 hops from scratch did not learn. r costs decode
+  time (r full-context reads per token, like r "X" blocks), not cache or prefill (E6).
 
 Question: split the stack in two halves, where the second half has no keys / values of
 its own and attends to one shared KV (key / value) cache computed once by the first half
@@ -37,7 +43,8 @@ for each "X" block:                  # cross-decoder
 
 - Written as a layer pattern with the "X" blocks last, in full: `LLLLXXXX`,
   `DDDDXXXX`, `GLGLXXXX` (+ `cross.kv=layer`). Validation rejects "X" anywhere but a
-  suffix, a cross-decoder without a self-decoder, looped cores and MTP "X" blocks.
+  suffix, a cross-decoder without a self-decoder, a loop core across the seam between
+  the two halves (E6) and MTP "X" blocks.
 - The cross-decoder never feeds the shared KV: a token's keys / values depend only on the
   self-decoder, so earlier positions reach later ones only through the self-decoder's
   states and the one shared KV.
@@ -217,3 +224,120 @@ Decode (static caches, one CUDA graph per token, no MTP), ms per token:
 - Training cost: the full pass is the baseline's for LLLLXXXX (126 vs 123 ms at 64K;
   338K vs 343K tok/s in E3). GLGLXXXX's full pass has six full-context attentions and is
   30% slower at 64K (no difference at the 2K training length).
+
+## E6: looped cross-decoder (`configs/lc/sweeps/yoco-loop.yaml`)
+
+E4's one hop per cross block suggests sharing the cross block's weights and iterating it:
+the loop core of `model.loop` may now lie inside the cross-decoder (`prelude` >= the
+first "X" block), e.g. `LLLL(X)xr` = `layer_pattern: LLLLX, num_layers: 5,
+loop.prelude: 4, loop.core: 1`:
+
+```
+x = self_decoder(x); K, V = shared_kv(x)
+s = 0
+repeat r times:                    # one weight-shared X block (or several)
+    s = inject(s, x)               # add: s + x (r = 1 is the unlooped model)
+    s = X(s, K, V)                 # re-query the same shared KV
+y = coda(s)                        # X blocks after the core, if any
+```
+
+- Only the query state iterates; the memory (shared KV) is fixed, so every iteration
+  can apply the same lookup. The self-decoder loop of notes/loop.md instead re-runs its
+  core over the whole context each iteration.
+- Cross-decoder blocks keep no state, so the cache does not depend on r: a prompt cached
+  at one iteration count can be decoded at any other (tested), and r costs compute on
+  the query tokens only (with `keep_last`, a prefill pays r X-block calls for one token).
+- The loop core may also lie in the self-decoder, before the "X" blocks (e.g.
+  `(LL)x2XX`); a core across the seam is rejected.
+- FSDP2 with a block called several times per forward is still untested (as for the
+  self-decoder loop).
+
+Arms (24000 steps, `global_rope: none`, chain settings of yoco-chain / loop-hops, 2
+seeds): `r2to10` (r drawn from 2-10 per step, evaluated at r = 10; the reference is
+loop-hops' r2to10 with a DG core: 98 / 90 / 86 / 77 / 49 / 30 / 14 % at 1-6, 8 hops and
+r = 10), `r4` (fixed r = 4: LLLLXXXX's compute with a quarter of its cross-decoder
+parameters), `h6r2to10` (1-6 hops from scratch, which the DG loop did not learn: 57 / 44
+/ 36 / 28 / 24 % at 2-6 hops). ~21 min per run (r4: 17), 5.25M non-embedding
+parameters (five blocks).
+
+Final accuracy at 2K on the trained hops (default r): 100 / 100 / 100 / 100 for r2to10
+and r4 (99.6-99.9% overall, both seeds of both arms; learned, i.e. crossed 90%, at
+13000 / 15000 and 7500 / 12000 steps). Over context lengths 512-16K: r2to10 100 / 100 / 100 / 100
+/ 99 / 98, r4 100 everywhere. h6r2to10 is at chance on every hop count, 1 hop included,
+in both seeds (training loss 0.096 / 0.098 at step 24000, still creeping down; r2to10:
+0.010 / 0.007).
+
+Final scan at 2K, mean of 2 seeds; 5-8 hops are past the training (10 and 12 hops are
+at chance, <= 21%, for every model and r):
+
+| arm | r | 1 | 2 | 3 | 4 | 5 | 6 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| r2to10 | 1 | 100 | 30 | 16 | 20 | 14 | 17 | 16 |
+| r2to10 | 2 | 100 | 100 | 29 | 15 | 14 | 15 | 20 |
+| r2to10 | 3 | 100 | 100 | 100 | 22 | 17 | 17 | 21 |
+| r2to10 | 4 | 100 | 100 | 100 | 98 | 23 | 18 | 16 |
+| r2to10 | 5 | 100 | 100 | 100 | 99 | 91 | 25 | 19 |
+| r2to10 | 6 | 100 | 100 | 100 | 99 | 93 | 58 | 22 |
+| r2to10 | 10 | 100 | 100 | 100 | 98 | 92 | 58 | 22 |
+| r2to10 | 24 | 99 | 99 | 100 | 96 | 87 | 53 | 21 |
+| r4 | 1 | 99 | 3 | 2 | 1 | 1 | 2 | 3 |
+| r4 | 2 | 100 | 100 | 1 | 2 | 3 | 0 | 4 |
+| r4 | 3 | 100 | 100 | 100 | 1 | 1 | 2 | 1 |
+| r4 | 4 | 100 | 100 | 100 | 100 | 4 | 3 | 3 |
+| r4 | 5 | 100 | 100 | 100 | 100 | 98 | 10 | 5 |
+| r4 | 6 | 100 | 100 | 100 | 100 | 96 | 68 | 7 |
+| r4 | 10 | 100 | 100 | 99 | 97 | 90 | 61 | 12 |
+| r4 | 24 | 100 | 93 | 85 | 86 | 73 | 42 | 8 |
+
+Per seed: 5 hops at r = 5, r2to10 94 / 89, r4 97 / 98; 6 hops at r = 6, r2to10 74 / 42,
+r4 57 / 79. r4 at r = 24 on 2-4 hops: s0 100 / 100 / 98, s1 87 / 71 / 73. At 8K the scan
+is within 5 points of 2K on 1-5 hops, 6 hops lose up to 10 (r2to10, r = 10: 99 / 100 /
+100 / 100 / 87 / 48; r4, r = 6: 100 / 100 / 100 / 98 / 93 / 67).
+
+- **One iteration per hop, exactly.** In both arms r iterations answer every chain of
+  up to r hops and fail at r + 1 (4 hops: 22% at r = 3, 98% at r = 4). E4's one hop per
+  cross block carries over to iterations of one block, and more sharply than in the DG
+  loop, which needed about r = 6 for 4 hops.
+- **The best multi-hop model of the lc experiments so far.** 100% on 1-4 hops in all four
+  runs. LLLLXXXX (yoco-chain, four distinct cross blocks, 8 blocks of parameters) gets
+  85% at 4 hops (4-seed mean), the looped DG core 77% (loop-hops r2to10, r = 10).
+- **One hop past the training, partly two.** 5 hops at 90-98% and 6 hops at 58-68% at
+  r = hops-10, against 49 / 30% for the DG loop. 8 hops stay at chance at every r, so what
+  stops longer chains is not the iteration count.
+- **A fixed r works, unlike in the DG loop.** There, a fixed r = 4 (add4) failed
+  completely at any other r ("only a weight-tied deep stack", notes/loop.md). Here r4
+  answers k hops at r = k for every k <= 4 and 5 hops at r = 5 (98%). The step it
+  learned holds still once the answer is reached: 1 hop at r = 4 means three idle
+  iterations. With too few iterations it is below chance (0-4%) where r2to10 is near it
+  (14-30%); it seems to output a definite wrong token, probably the node reached after
+  r hops (not checked). Random r is not needed for the knob here. What it buys is
+  stability at large r: at r = 24, r2to10 loses <= 5 points on 1-5 hops, while r4
+  loses up to 29 points on 2-4 hops in s1. r4 also learned sooner (7500 / 12000 steps
+  against 13000 / 15000).
+- Why the cross loop beats the DG loop is not established. A likely reason is that
+  only the query state iterates, over a fixed memory, so each iteration can apply the
+  same lookup; the DG core instead re-encodes the whole context every iteration.
+- **1-6 hops from scratch did not learn at all**, not even the 1-hop chains. The looped
+  DG core learned 1 hop in that setting, and yoco-split's LLXXXXXX (six distinct cross
+  blocks) learned 1-6 hops. Follow-ups running: the loop-curriculum recipe (continue
+  r2to10 on 1-6 hops, `yoco-loop-curriculum.yaml`) and a fixed r = 6 from scratch
+  (`h6r6`).
+
+Cost (`runs/yoco-loop-bench.md`, E5 setup: ngram-small shape, random weights, static-cache
+CUDA-graph decode). `LLLL(X)xr` has 19.0M non-embedding parameters, against 30.0M for
+LLLLXXXX:
+
+| layers | decode ms 32K, batch 1 | decode ms 32K, batch 32 | prefill ms 64K | full ms 64K | cache MB 64K |
+|---|---|---|---|---|---|
+| GLGLGLGL (E5) | 1.383 | 1.973 | 122.1 | 122.6 | 129.0 |
+| LLLLXXXX (E5) | 1.383 | 2.024 | 26.7 | 126.4 | 33.0 |
+| LLLL(X)x1 | 0.576 | 0.815 | | | |
+| LLLL(X)x4 | 1.389 | 2.027 | 26.7 | 125.9 | 33.0 |
+| LLLL(X)x10 | 3.038 | 4.452 | 29.7 | 279.5 | 33.0 |
+
+- Each iteration reads the whole shared KV per token, like an "X" block. So r = 4 costs
+  exactly what LLLLXXXX costs at decode, and r = 10 costs 2.2x the GL baseline per
+  token. r = 10 is only needed for chains past 4 hops.
+- The prefill (the iterations run on the last position only) and the cache do not
+  depend on r. Training does: the full pass is 2.2x longer at r = 10 than at r = 4, and
+  r2to10 (mean r = 6) trained in 21.5 min against 17.3 for r4 at the lc scale.

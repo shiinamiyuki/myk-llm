@@ -2,7 +2,8 @@
 
 With `loop.core` set, the blocks are prelude -> core (looped, shared weights) -> coda.
 With trailing "X" blocks (decoder-decoder, YOCO) they are self-decoder -> shared KV ->
-cross-decoder.
+cross-decoder; the looped core then lies either in the self-decoder or in the
+cross-decoder (a looped cross-decoder re-queries the same shared KV every iteration).
 
 The model returns hidden states, not a loss. Objectives (cross entropy, z-loss,
 multi-token prediction, distillation) live in `myk_llm.train.objectives` and use
@@ -217,8 +218,10 @@ class MykLLM(nn.Module):
         task-specific positional signal computed outside the model).
 
         `iterations` sets the core iteration count of a looped model (test-time depth;
-        default: see `num_iterations`). Every block call keeps its own cache entry, so a
-        cache only fits passes with the iteration count it was built with.
+        default: see `num_iterations`). Every self-decoder block call keeps its own cache
+        entry, so a cache only fits passes with the iteration count it was built with;
+        cross-decoder blocks keep no state, so the cache of a looped cross-decoder fits
+        every iteration count.
 
         `keep_last` > 0: only the outputs of the last `keep_last` positions are needed
         (e.g. a prefill), so the cross-decoder of a decoder-decoder model and the final norm
@@ -240,10 +243,13 @@ class MykLLM(nn.Module):
         x, ngram_updates = self.embed(input_ids, prefix_ids)
         if embed_offset is not None:
             x = x + embed_offset
-        loop = self.config.loop
+        loop, cross_start, num_layers = self.config.loop, self.cross_start, len(self.layers)
         iterations = self.num_iterations(iterations)
-        # One cache entry per block call, plus the shared KV (decoder-decoder, project).
-        num_calls = len(self.layers) + loop.core * (iterations - 1) + (self.shared_kv is not None)
+        cross_loop = bool(loop.core) and loop.prelude >= cross_start  # the core is cross-decoder blocks
+        self_core = 0 if cross_loop else loop.core
+        # One cache entry per self-decoder block call, plus the shared KV (decoder-decoder,
+        # project), plus one (empty) entry per cross-decoder block, however often it runs.
+        num_calls = num_layers + self_core * (iterations - 1) + (self.shared_kv is not None)
         if cache is not None and len(cache) != num_calls:
             raise ValueError(f"cache has {len(cache)} entries but this pass runs {num_calls} blocks (iteration count changed?)")
         states = iter(cache if cache is not None else [None] * num_calls)
@@ -260,30 +266,38 @@ class MykLLM(nn.Module):
                 shared = state
             return x
 
+        def cross(index: int, x: torch.Tensor) -> torch.Tensor:
+            return self.layers[index](x, position_ids, varlen, shared)[0]
+
         def enter(index: int, x: torch.Tensor) -> torch.Tensor:
             return x + ngram_updates[index][:, -x.size(1) :] if index in ngram_updates else x
 
-        core_start = loop.prelude if loop.core else self.cross_start
-        for index in range(core_start):
-            x = run(index, enter(index, x))
-        if loop.core:
-            x = self._run_core(enter(core_start, x), run, iterations)
-        for index in range(core_start + loop.core, self.cross_start):
-            x = run(index, enter(index, x))
+        def stack(start: int, end: int, block: Callable[[int, torch.Tensor], torch.Tensor], looped: bool, x: torch.Tensor) -> torch.Tensor:
+            """Blocks [start, end) in order, with the loop core among them if `looped`."""
+            core_start = loop.prelude if looped else end
+            for index in range(start, core_start):
+                x = block(index, enter(index, x))
+            if looped:
+                x = self._run_core(enter(core_start, x), block, iterations)
+            for index in range(core_start + loop.core if looped else end, end):
+                x = block(index, enter(index, x))
+            return x
+
+        x = stack(0, cross_start, run, bool(self_core), x)
         self_output, self_positions = x, position_ids
         if keep_last:
             x, position_ids = x[:, -keep_last:], position_ids[:, -keep_last:]
-        if self.cross_start < len(self.layers):
+        if cross_start < num_layers:
             if self.shared_kv is not None:
                 # From the self-decoder output at every position, not only the kept ones.
                 shared = self.shared_kv(self_output, self_positions, next(states))
                 if new_cache is not None:
                     new_cache.append(shared)
-            for index in range(self.cross_start, len(self.layers)):
-                x, _ = self.layers[index](enter(index, x), position_ids, varlen, shared)
+            for _ in range(cross_start, num_layers):  # cross-decoder blocks keep no state
                 next(states)
                 if new_cache is not None:
                     new_cache.append(None)
+            x = stack(cross_start, num_layers, cross, cross_loop, x)
         output = ModelOutput(self.final_norm(x), x, position_ids, varlen, new_cache)
         return head(self, output) if head is not None else output
 
@@ -303,11 +317,11 @@ class MykLLM(nn.Module):
             return self._iteration_rng.randint(*loop.train_iterations)
         return loop.iterations
 
-    def _run_core(self, inputs: torch.Tensor, run: Callable[[int, torch.Tensor], torch.Tensor], iterations: int) -> torch.Tensor:
-        """The core blocks, `iterations` times over a loop state that starts at zero and
-        takes in `inputs` at the start of every iteration. With truncated backpropagation
-        the earlier iterations run without autograd (gradients still reach `inputs`
-        through the later ones)."""
+    def _run_core(self, inputs: torch.Tensor, block: Callable[[int, torch.Tensor], torch.Tensor], iterations: int) -> torch.Tensor:
+        """The core blocks (`block(index, x)` runs one), `iterations` times over a loop
+        state that starts at zero and takes in `inputs` at the start of every iteration.
+        With truncated backpropagation the earlier iterations run without autograd
+        (gradients still reach `inputs` through the later ones)."""
         loop, injection = self.config.loop, self.injection
         assert injection is not None
         grad = torch.is_grad_enabled()
@@ -317,7 +331,7 @@ class MykLLM(nn.Module):
             with torch.set_grad_enabled(grad and iteration >= first_tracked):
                 state = injection(state, inputs)
                 for index in range(loop.prelude, loop.prelude + loop.core):
-                    state = run(index, state)
+                    state = block(index, state)
         return state
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:

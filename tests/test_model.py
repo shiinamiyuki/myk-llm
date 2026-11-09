@@ -32,9 +32,19 @@ VARIANTS = {
     "yoco_layer_kv": {"layer_pattern": "GLXX", "cross.kv": "layer", "attention.global_rope": "all"},
     "yoco_ngram": {"layer_pattern": "LLXX", "ngram.orders": "[2]", "ngram.num_buckets": "1024", "ngram.dim": "32",
                    "ngram.layers": "[0, 3]"},
+    # Looped cross-decoders: LL(X)x3X, GLX(X)x3 (concat injection, reused KV), LL(XX)x3
+    # trained on 2-4 iterations with truncated backprop; and a looped self-decoder (LL)x2XX.
+    "yoco_loop": {"layer_pattern": "LLXX", "loop.prelude": "2", "loop.core": "1", "loop.iterations": "3"},
+    "yoco_loop_concat_layer_kv": {"layer_pattern": "GLXX", "cross.kv": "layer", "attention.global_rope": "all",
+                                  "loop.prelude": "3", "loop.core": "1", "loop.iterations": "3",
+                                  "loop.injection": "concat"},
+    "yoco_loop_truncated": {"layer_pattern": "LLXX", "loop.prelude": "2", "loop.core": "2", "loop.iterations": "3",
+                            "loop.train_iterations": "[2, 4]", "loop.backprop_iterations": "2"},
+    "yoco_self_loop": {"layer_pattern": "LLXX", "loop.core": "2", "loop.iterations": "2"},
 }
 
 LOOP = {"loop.prelude": "1", "loop.core": "2", "loop.iterations": "3"}  # blocks 1-2 looped, block 3 the coda
+CROSS_LOOP = {"layer_pattern": "LLXX", "loop.prelude": "2", "loop.core": "1", "loop.iterations": "3"}  # LL(X)x3X
 
 
 def build(**overrides) -> MykLLM:
@@ -163,22 +173,26 @@ def test_loop_config_is_validated():
     assert config.layout == "G(DG)x3D" and config.effective_layers == 8
 
 
-def test_one_add_iteration_is_the_unlooped_model():
-    base, looped = build(), build(**{**LOOP, "loop.iterations": "1"})
+@pytest.mark.parametrize("loop", [LOOP, CROSS_LOOP], ids=["self", "cross"])
+def test_one_add_iteration_is_the_unlooped_model(loop):
+    base = build(**{k: v for k, v in loop.items() if not k.startswith("loop.")})
+    looped = build(**{**loop, "loop.iterations": "1"})
     looped.load_state_dict(base.state_dict())
     ids = torch.randint(0, 500, (2, 64), device="cuda")
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         torch.testing.assert_close(looped(ids).hidden, base(ids).hidden, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(("loop", "calls"), [(LOOP, [0, 1, 2, 1, 2, 1, 2, 3]), (CROSS_LOOP, [0, 1, 2, 2, 2, 3])],
+                         ids=["self", "cross"])
 @torch.no_grad()
-def test_core_blocks_run_once_per_iteration():
-    model = build(**LOOP)
+def test_core_blocks_run_once_per_iteration(loop, calls):
+    model = build(**loop)
     log = record_block_calls(model)
     ids = torch.randint(0, 500, (1, 32), device="cuda")
     with torch.autocast("cuda", dtype=torch.bfloat16):
         model(ids)
-        assert [index for index, _ in log] == [0, 1, 2, 1, 2, 1, 2, 3]
+        assert [index for index, _ in log] == calls
         log.clear()
         model(ids, iterations=1)
         assert [index for index, _ in log] == [0, 1, 2, 3]
@@ -229,7 +243,8 @@ def test_cache_is_tied_to_the_iteration_count():
 
 def test_cross_decoder_config_is_validated():
     for bad in ({"layer_pattern": "LX"}, {"layer_pattern": "XXXX"}, {"layer_pattern": "LXLX"},
-                {"layer_pattern": "LLXX", "cross.kv": "layer"}, {"layer_pattern": "LLXX", **LOOP},
+                {"layer_pattern": "LLXX", "cross.kv": "layer"},
+                {"layer_pattern": "LLXX", **LOOP},  # a loop core across the self- / cross-decoder seam
                 {"layer_pattern": "LLXX", "mtp.depth": "1", "mtp.layer": "X"}):
         with pytest.raises(ValueError):
             tiny_model_config(**bad)
@@ -238,6 +253,8 @@ def test_cross_decoder_config_is_validated():
     # The shared keys are rotated exactly when they are the first global attention under "first".
     assert not config.cross_rope and tiny_model_config(layer_pattern="LLXX").cross_rope
     assert tiny_model_config(layer_pattern="GLXX", **{"cross.kv": "layer"}).cross_rope
+    assert tiny_model_config(**CROSS_LOOP).layout == "LL(X)x3X"
+    assert tiny_model_config(layer_pattern="LLXX", **{"loop.core": "2", "loop.iterations": "2"}).layout == "(LL)x2XX"
 
 
 @pytest.mark.parametrize("name", [n for n in VARIANTS if n.startswith(("baseline", "deltanet", "yoco"))])
@@ -260,7 +277,7 @@ def test_keep_last_matches_the_full_pass(name):
         assert kl(model.logits(a.hidden), model.logits(b.hidden)) < 1e-4
 
 
-@pytest.mark.parametrize("name", ["yoco", "yoco_layer_kv"])
+@pytest.mark.parametrize("name", ["yoco", "yoco_layer_kv", "yoco_loop", "yoco_loop_concat_layer_kv"])
 @torch.no_grad()
 def test_cross_decoder_caches_one_global_kv(name):
     """The cache of a decoder-decoder holds the self-decoder states and one shared KV;
@@ -272,7 +289,23 @@ def test_cross_decoder_caches_one_global_kv(name):
     full_length = [entry for entry in cache if entry is not None and entry.keys.size(1) == 100]
     assert len(full_length) == 1  # the shared KV (the local layer keeps only its window)
     assert cache[-2:] == [None, None]
-    assert len(cache) == 4 + (name == "yoco")
+    assert len(cache) == 4 + (VARIANTS[name].get("cross.kv") != "layer")
+
+
+@pytest.mark.parametrize("name", ["yoco_loop", "yoco_loop_concat_layer_kv"])
+@torch.no_grad()
+def test_looped_cross_decoder_cache_fits_every_iteration_count(name):
+    """Cross-decoder blocks keep no state, so a prompt cached at the default iteration
+    count can be continued at another one: decoding at r = 5 from a cache built at r = 3
+    gives the full r = 5 pass."""
+    model = build(**VARIANTS[name])
+    ids = torch.randint(0, 500, (2, 101), device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        full = model.logits(model(ids, iterations=5).hidden[:, -1:])
+        cache = model(ids[:, :100], use_cache=True, keep_last=1).cache
+        step = model(ids[:, 100:], position_ids=torch.full((2, 1), 100, device="cuda"), cache=cache,
+                     use_cache=True, iterations=5)
+    assert kl(full, model.logits(step.hidden)) < 1e-3
 
 
 @torch.no_grad()
