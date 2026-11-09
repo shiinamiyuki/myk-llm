@@ -4,7 +4,8 @@ without multi-token-prediction (MTP) speculative decoding.
 One decode iteration is captured as a CUDA graph over static KV caches (attention is
 switched to `flash_attn_with_kvcache` on preallocated buffers for this benchmark only;
 the model's own decoding grows its cache with torch.cat, which cannot be captured), with
-`--context` tokens already cached. With K drafted tokens an iteration is:
+`--context` tokens already cached. A decoder-decoder (model.cross) gets one static
+buffer for its shared KV, which every cross-decoder block reads. With K drafted tokens an iteration is:
 
   verify   the main model on K + 1 tokens (last token + K drafts), output head on all K + 1
   draft    K MTP modules in sequence, each one block + output head on one token
@@ -21,16 +22,31 @@ size enters.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 
 import torch
 
 from myk_llm.configuration import load_config
 from myk_llm.model import MykLLM
-from myk_llm.model.mixers import Attention
+from myk_llm.model.mixers import Attention, CrossAttention, SharedKV
 from myk_llm.ops.flash_attn import flash_attn_with_kvcache
 from myk_llm.train.config import TrainConfig
 
 _eager_attention = Attention.forward
+_eager_shared_kv = SharedKV.forward
+_eager_attend = CrossAttention.attend
+
+
+@dataclass
+class StaticKV:
+    """A decoder-decoder's shared KV in a static cache, plus this pass's new keys / values
+    (each cross-decoder block writes them again before attending: same values, same slots)."""
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    keys: torch.Tensor
+    values: torch.Tensor
+    cache_seqlens: torch.Tensor
 
 
 def _static_attention(self, x, position_ids, varlen=None, state=None, use_cache=False):
@@ -54,15 +70,32 @@ def _static_attention(self, x, position_ids, varlen=None, state=None, use_cache=
     out = out.reshape(batch, seq_len, -1)
     if self.gate_proj is not None:
         out = out * torch.sigmoid(self.gate_proj(x))
-    return self.o_proj(out), None
+    shared = StaticKV(k_cache, v_cache, k, v, cache_seqlens) if self.shares_kv else None  # cross.kv=layer
+    return self.o_proj(out), shared
+
+
+def _static_shared_kv(self, x, position_ids, state=None):
+    if not hasattr(self, "_static"):
+        return _eager_shared_kv(self, x, position_ids, state)
+    new = _eager_shared_kv(self, x, position_ids)  # keys / values of the new positions
+    return StaticKV(*self._static[:2], new.keys, new.values, self._static[2])
+
+
+def _static_attend(self, q, kv, varlen):
+    if not isinstance(kv, StaticKV):
+        return _eager_attend(self, q, kv, varlen)
+    return flash_attn_with_kvcache(q, kv.k_cache, kv.v_cache, k=kv.keys, v=kv.values,
+                                   cache_seqlens=kv.cache_seqlens, causal=True)
 
 
 Attention.forward = _static_attention
+SharedKV.forward = _static_shared_kv
+CrossAttention.attend = _static_attend
 
 
 def attach_caches(model: MykLLM, batch: int, max_len: int, cache_seqlens: torch.Tensor) -> None:
     for module in model.modules():
-        if isinstance(module, Attention):
+        if isinstance(module, (Attention, SharedKV)):
             shape = (batch, max_len, module.num_kv_heads, module.head_dim)
             k = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
             module._static = (k, torch.zeros_like(k), cache_seqlens)
@@ -142,6 +175,8 @@ def main() -> None:
 
     overrides = [*args.overrides, f"model.mtp.depth={max(args.drafts)}"]
     config = load_config(TrainConfig, args.config, overrides).model
+    # Room in the rotary position table for the cached context plus one iteration's tokens.
+    config.max_seq_len = max(config.max_seq_len, args.context + max(args.drafts) + 1)
     torch.manual_seed(0)
     model = MykLLM(config).cuda().to(torch.bfloat16).eval()
     if args.compile:  # one graph per (block kind, token count): raise the recompile limit

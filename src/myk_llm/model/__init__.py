@@ -1,5 +1,6 @@
 from .config import (
     AttentionConfig,
+    CrossDecoderConfig,
     DeltaNetConfig,
     FFNConfig,
     LoopConfig,
@@ -14,6 +15,7 @@ from .transformer import MykLLM, ModelOutput
 
 __all__ = [
     "AttentionConfig",
+    "CrossDecoderConfig",
     "DeltaNetConfig",
     "FFNConfig",
     "LoopConfig",

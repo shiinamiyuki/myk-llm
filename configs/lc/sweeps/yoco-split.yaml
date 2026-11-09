@@ -1,0 +1,21 @@
+# Decoder-decoder (YOCO) split ratio on multi-hop chains (notes/yoco.md, after
+# yoco-chain.yaml): is the hop reach of a cross-decoder set by its number of "X" blocks
+# (one lookup into the shared KV per block)? Trained on 1-6 hops (min_len 320: 8 six-hop
+# chains + queries = 288 tokens) so that a 6-block cross-decoder has room to show it;
+# LLGGGGGG is the unshared control for LLXXXXXX (same depth, six global KV caches).
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/yoco-split.yaml --report --at 2048
+name: yoco-split
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [steps=24000, task.cot=false, model.attention.global_rope=none,
+            "task.hops=[1, 2, 3, 4, 5, 6]", task.min_len=320,
+            "task.eval_hops=[1, 2, 3, 4, 5, 6, 8, 10]", "scan_lengths=[2048, 8192]"]
+axes:
+  arch:
+    LLLLLLXX: [model.layer_pattern=LLLLLLXX]
+    LLLLXXXX: [model.layer_pattern=LLLLXXXX]
+    LLXXXXXX: [model.layer_pattern=LLXXXXXX]
+    LLGGGGGG: [model.layer_pattern=LLGGGGGG]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]

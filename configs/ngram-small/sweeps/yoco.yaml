@@ -1,0 +1,21 @@
+# Decoder-decoder (YOCO, model.cross; notes/yoco.md) on real text: the small-scale LM
+# testbed (hidden 512, 8 layers, ~400M FineWeb-Edu en + zh tokens, 64K vocabulary), one
+# seed (seed spread here: 0.0005-0.005 bpb). global_rope stays "first": RoPE on the first
+# global attention of the stack, which for LLLLXXXX is the shared KV.
+#   GL               the baseline GLGLGLGL (4 global KV caches); rerun with the current kernels
+#   GLGLXXXX_layer   the second half reuses the first half's last global layer (2) KV (2 caches)
+#   LLLLXXXX         YOCO: sliding-window self-decoder, KV projected from its output (1 cache)
+#   LLLLGGGG         same layer types as LLLLXXXX, each global layer with its own KV (4 caches)
+#   LLLLLLLG         one global layer (1 cache, like YOCO)
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/yoco.yaml --report
+name: yoco-lm
+overrides: [logging.tensorboard=false]   # tensorboard is optional; metrics.jsonl is the log
+configs:
+  v64k: configs/ngram-small/v64k.yaml
+axes:
+  arch:
+    GL: []
+    GLGLXXXX_layer: [model.layer_pattern=GLGLXXXX, model.cross.kv=layer]
+    LLLLXXXX: [model.layer_pattern=LLLLXXXX]
+    LLLLGGGG: [model.layer_pattern=LLLLGGGG]
+    LLLLLLLG: [model.layer_pattern=LLLLLLLG]

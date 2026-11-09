@@ -1,6 +1,8 @@
 """The MykLLM decoder: embeddings -> blocks -> final norm, plus optional MTP modules.
 
 With `loop.core` set, the blocks are prelude -> core (looped, shared weights) -> coda.
+With trailing "X" blocks (decoder-decoder, YOCO) they are self-decoder -> shared KV ->
+cross-decoder.
 
 The model returns hidden states, not a loss. Objectives (cross entropy, z-loss,
 multi-token prediction, distillation) live in `myk_llm.train.objectives` and use
@@ -21,7 +23,7 @@ from torch.utils.checkpoint import checkpoint
 from .config import GLOBAL_ATTENTION, ModelConfig
 from .embeddings import Embeddings
 from .layers import ResidualGate, RMSNorm, SwiGLU, init_linear_, residual_init_scale
-from .mixers import Varlen, build_mixer
+from .mixers import Attention, SharedKV, Varlen, build_mixer
 
 
 class Block(nn.Module):
@@ -50,7 +52,8 @@ class Block(nn.Module):
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, Any]:
         if self.activation_checkpointing and torch.is_grad_enabled() and not use_cache:
-            return checkpoint(self._forward, x, position_ids, varlen, None, False, use_reentrant=False)
+            # `state` is None here except for a cross-decoder block (the shared KV).
+            return checkpoint(self._forward, x, position_ids, varlen, state, False, use_reentrant=False)
         return self._forward(x, position_ids, varlen, state, use_cache)
 
     def _forward(
@@ -135,6 +138,13 @@ class MykLLM(nn.Module):
             self.lm_head.weight = self.embed.token.weight
         self.mtp = nn.ModuleList(MTPModule(config) for _ in range(config.mtp.depth))
         self.injection = Injection(config) if config.loop.core else None
+        self.cross_start, self.cross_kv_layer = config.cross_start, config.cross_kv_layer
+        has_cross = self.cross_start < len(self.layers)
+        self.shared_kv = SharedKV(config) if has_cross and config.cross.kv == "project" else None
+        if self.cross_kv_layer is not None:
+            source = self.layers[self.cross_kv_layer].mixer
+            assert isinstance(source, Attention)
+            source.shares_kv = True
         # Training draws iteration counts from its own generator, seeded like the model
         # init, so that every FSDP rank runs the same blocks in the same order.
         self._iteration_rng = random.Random(torch.initial_seed())
@@ -175,6 +185,9 @@ class MykLLM(nn.Module):
 
     def compile_blocks(self, **kwargs: Any) -> None:
         """torch.compile each block in place (parameter names are unchanged)."""
+        # All blocks share Block.forward, so every (layer type, grad mode, shape) variant
+        # is one more compiled entry of the same code; past the limit, blocks run eagerly.
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 16)
         for block in self.blocks:
             block.compile(**kwargs)
 
@@ -194,6 +207,7 @@ class MykLLM(nn.Module):
         head: Callable[["MykLLM", ModelOutput], Any] | None = None,
         embed_offset: torch.Tensor | None = None,
         iterations: int | None = None,
+        keep_last: int = 0,
     ) -> Any:
         """`seqlens` enables document masking (training); `cache`/`use_cache` drive
         incremental decoding; `prefix_ids` are the tokens preceding `input_ids`
@@ -206,6 +220,11 @@ class MykLLM(nn.Module):
         default: see `num_iterations`). Every block call keeps its own cache entry, so a
         cache only fits passes with the iteration count it was built with.
 
+        `keep_last` > 0: only the outputs of the last `keep_last` positions are needed
+        (e.g. a prefill), so the cross-decoder of a decoder-decoder model and the final norm
+        run on those positions only; `hidden`, `residual` and `position_ids` of the output
+        then cover just them. The cache is complete either way.
+
         Returns a ModelOutput, or `head(self, output)` when `head` is given. Losses run
         as a head so that they execute inside forward: under FSDP (fully sharded data
         parallel) the root parameters (embedding / output head) are only gathered there.
@@ -215,36 +234,56 @@ class MykLLM(nn.Module):
             position_ids = torch.arange(seq_len, device=input_ids.device).expand(batch, -1)
         varlen = None
         if seqlens is not None:
-            if use_cache:
-                raise ValueError("document masking (seqlens) cannot be combined with a cache")
+            if use_cache or keep_last:
+                raise ValueError("document masking (seqlens) cannot be combined with a cache or keep_last")
             varlen = build_varlen(seqlens, batch, seq_len, input_ids.device)
         x, ngram_updates = self.embed(input_ids, prefix_ids)
         if embed_offset is not None:
             x = x + embed_offset
         loop = self.config.loop
         iterations = self.num_iterations(iterations)
-        num_calls = len(self.layers) + loop.core * (iterations - 1)
+        # One cache entry per block call, plus the shared KV (decoder-decoder, project).
+        num_calls = len(self.layers) + loop.core * (iterations - 1) + (self.shared_kv is not None)
         if cache is not None and len(cache) != num_calls:
             raise ValueError(f"cache has {len(cache)} entries but this pass runs {num_calls} blocks (iteration count changed?)")
         states = iter(cache if cache is not None else [None] * num_calls)
         new_cache: list[Any] | None = [] if use_cache else None
 
+        shared: Any = None  # the cross-decoder's keys / values
+
         def run(index: int, x: torch.Tensor) -> torch.Tensor:
+            nonlocal shared
             x, state = self.layers[index](x, position_ids, varlen, next(states), use_cache)
             if new_cache is not None:
                 new_cache.append(state)
+            if index == self.cross_kv_layer:
+                shared = state
             return x
 
         def enter(index: int, x: torch.Tensor) -> torch.Tensor:
-            return x + ngram_updates[index] if index in ngram_updates else x
+            return x + ngram_updates[index][:, -x.size(1) :] if index in ngram_updates else x
 
-        core_start = loop.prelude if loop.core else len(self.layers)
+        core_start = loop.prelude if loop.core else self.cross_start
         for index in range(core_start):
             x = run(index, enter(index, x))
         if loop.core:
             x = self._run_core(enter(core_start, x), run, iterations)
-        for index in range(core_start + loop.core, len(self.layers)):
+        for index in range(core_start + loop.core, self.cross_start):
             x = run(index, enter(index, x))
+        self_output, self_positions = x, position_ids
+        if keep_last:
+            x, position_ids = x[:, -keep_last:], position_ids[:, -keep_last:]
+        if self.cross_start < len(self.layers):
+            if self.shared_kv is not None:
+                # From the self-decoder output at every position, not only the kept ones.
+                shared = self.shared_kv(self_output, self_positions, next(states))
+                if new_cache is not None:
+                    new_cache.append(shared)
+            for index in range(self.cross_start, len(self.layers)):
+                x, _ = self.layers[index](enter(index, x), position_ids, varlen, shared)
+                next(states)
+                if new_cache is not None:
+                    new_cache.append(None)
         output = ModelOutput(self.final_norm(x), x, position_ids, varlen, new_cache)
         return head(self, output) if head is not None else output
 

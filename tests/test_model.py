@@ -25,6 +25,13 @@ VARIANTS = {
                              "loop.injection": "concat"},
     "loop_truncated": {"loop.core": "2", "loop.iterations": "3", "loop.train_iterations": "[2, 4]",
                        "loop.backprop_iterations": "2"},
+    "yoco": {"layer_pattern": "LLXX"},
+    "yoco_deltanet": {"layer_pattern": "DDXX"},
+    "yoco_rope_qknorm_gate": {"layer_pattern": "LLXX", "attention.global_rope": "all", "attention.qk_norm": "true",
+                              "attention.output_gate": "true"},
+    "yoco_layer_kv": {"layer_pattern": "GLXX", "cross.kv": "layer", "attention.global_rope": "all"},
+    "yoco_ngram": {"layer_pattern": "LLXX", "ngram.orders": "[2]", "ngram.num_buckets": "1024", "ngram.dim": "32",
+                   "ngram.layers": "[0, 3]"},
 }
 
 LOOP = {"loop.prelude": "1", "loop.core": "2", "loop.iterations": "3"}  # blocks 1-2 looped, block 3 the coda
@@ -64,7 +71,7 @@ def test_incremental_decoding_matches_full_forward(name):
 @torch.no_grad()
 def test_document_masking_isolates_documents(name):
     """A packed row with document masking == each document run on its own."""
-    if name.startswith("ngram"):
+    if "ngram" in name:
         pytest.skip("n-grams read across document seams by design")
     model = build(**VARIANTS[name])
     ids = torch.randint(0, 500, (1, 256), device="cuda")
@@ -218,3 +225,64 @@ def test_cache_is_tied_to_the_iteration_count():
             model(ids[:, 32:], position_ids=torch.full((1, 1), 32, device="cuda"), cache=cache, use_cache=True, iterations=2)
     with pytest.raises(ValueError):
         build()(ids, iterations=2)  # not a looped model
+
+
+def test_cross_decoder_config_is_validated():
+    for bad in ({"layer_pattern": "LX"}, {"layer_pattern": "XXXX"}, {"layer_pattern": "LXLX"},
+                {"layer_pattern": "LLXX", "cross.kv": "layer"}, {"layer_pattern": "LLXX", **LOOP},
+                {"layer_pattern": "LLXX", "mtp.depth": "1", "mtp.layer": "X"}):
+        with pytest.raises(ValueError):
+            tiny_model_config(**bad)
+    config = tiny_model_config(layer_pattern="GLGX", **{"cross.kv": "layer"})
+    assert config.cross_start == 3 and config.cross_kv_layer == 2
+    # The shared keys are rotated exactly when they are the first global attention under "first".
+    assert not config.cross_rope and tiny_model_config(layer_pattern="LLXX").cross_rope
+    assert tiny_model_config(layer_pattern="GLXX", **{"cross.kv": "layer"}).cross_rope
+
+
+@pytest.mark.parametrize("name", [n for n in VARIANTS if n.startswith(("baseline", "deltanet", "yoco"))])
+@torch.no_grad()
+def test_keep_last_matches_the_full_pass(name):
+    """A pass that keeps only the last positions (the cross-decoder runs on them alone)
+    gives the full pass's outputs there and the same cache."""
+    model = build(**VARIANTS[name])
+    ids = torch.randint(0, 500, (2, 150), device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        full = model(ids, use_cache=True)
+        last = model(ids, use_cache=True, keep_last=3)
+        assert last.hidden.shape[1] == 3
+        assert kl(model.logits(full.hidden[:, -3:]), model.logits(last.hidden)) < 1e-4
+        nxt = torch.randint(0, 500, (2, 1), device="cuda")
+        prefix = ids[:, -model.embed.context :] if model.embed.context else None
+        position = torch.full((2, 1), 150, device="cuda")
+        a = model(nxt, position_ids=position, cache=full.cache, use_cache=True, prefix_ids=prefix)
+        b = model(nxt, position_ids=position, cache=last.cache, use_cache=True, prefix_ids=prefix)
+        assert kl(model.logits(a.hidden), model.logits(b.hidden)) < 1e-4
+
+
+@pytest.mark.parametrize("name", ["yoco", "yoco_layer_kv"])
+@torch.no_grad()
+def test_cross_decoder_caches_one_global_kv(name):
+    """The cache of a decoder-decoder holds the self-decoder states and one shared KV;
+    the cross-decoder blocks cache nothing."""
+    model = build(**VARIANTS[name])
+    ids = torch.randint(0, 500, (1, 100), device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        cache = model(ids, use_cache=True).cache
+    full_length = [entry for entry in cache if entry is not None and entry.keys.size(1) == 100]
+    assert len(full_length) == 1  # the shared KV (the local layer keeps only its window)
+    assert cache[-2:] == [None, None]
+    assert len(cache) == 4 + (name == "yoco")
+
+
+@torch.no_grad()
+def test_cross_decoder_does_not_feed_the_shared_kv():
+    """Earlier positions reach later ones only through the self-decoder: changing a
+    cross-decoder weight leaves the shared KV unchanged."""
+    model = build(**VARIANTS["yoco"])
+    ids = torch.randint(0, 500, (1, 64), device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        before = model(ids, use_cache=True).cache[2]
+        model.layers[2].ffn.down_proj.weight.mul_(5)
+        after = model(ids, use_cache=True).cache[2]
+    torch.testing.assert_close(before.keys, after.keys, rtol=0, atol=0)

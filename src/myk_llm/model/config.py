@@ -10,7 +10,8 @@ from typing import Literal
 GLOBAL_ATTENTION = "G"  # full causal softmax attention
 LOCAL_ATTENTION = "L"  # sliding-window softmax attention
 DELTANET = "D"  # Gated DeltaNet linear attention (needs flash-linear-attention)
-LAYER_CODES = (GLOBAL_ATTENTION, LOCAL_ATTENTION, DELTANET)
+CROSS_ATTENTION = "X"  # cross-decoder: causal attention over the shared KV (see CrossDecoderConfig)
+LAYER_CODES = (GLOBAL_ATTENTION, LOCAL_ATTENTION, DELTANET, CROSS_ATTENTION)
 
 
 @dataclass
@@ -124,6 +125,27 @@ class LoopConfig:
 
 
 @dataclass
+class CrossDecoderConfig:
+    """Decoder-decoder (YOCO, "You Only Cache Once", Sun et al., 2024). The trailing "X"
+    blocks of `layer_pattern` (written out in full, e.g. "LLLLXXXX") form the
+    cross-decoder; the blocks before them, the self-decoder. One set of keys / values
+    (the shared KV) is computed once from the self-decoder; every cross-decoder block
+    attends to it causally with its own queries and has no keys / values of its own.
+
+      project: K, V = Linear(norm(self-decoder output)) (YOCO)
+      layer:   the K, V of the self-decoder's last global ("G") layer, i.e. the second half
+               reuses that layer's attention cache
+
+    So the cache holds one global KV plus the self-decoder's states, and a prefill only
+    needs the cross-decoder on the positions whose outputs are used (`keep_last`).
+    Queries get RoPE exactly when the shared keys do: under global_rope "all", or "first"
+    when the shared KV is the first global attention of the stack.
+    """
+
+    kv: Literal["project", "layer"] = "project"
+
+
+@dataclass
 class ModelConfig:
     vocab_size: int = 65536
     hidden_size: int = 1024
@@ -140,6 +162,7 @@ class ModelConfig:
     ngram: NgramEmbeddingConfig = field(default_factory=NgramEmbeddingConfig)
     mtp: MTPConfig = field(default_factory=MTPConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
+    cross: CrossDecoderConfig = field(default_factory=CrossDecoderConfig)
 
     def __post_init__(self) -> None:
         if not self.layer_pattern or set(self.layer_pattern) - set(LAYER_CODES):
@@ -153,8 +176,17 @@ class ModelConfig:
             layers = self.ngram.layers
             if not layers or len(set(layers)) != len(layers) or not all(0 <= i < self.num_layers for i in layers):
                 raise ValueError(f"ngram.layers must be distinct block indices in [0, {self.num_layers}), got {layers}")
-        if self.mtp.layer not in LAYER_CODES:
-            raise ValueError(f"mtp.layer must be one of {LAYER_CODES}")
+        if self.mtp.layer not in LAYER_CODES or self.mtp.layer == CROSS_ATTENTION:
+            raise ValueError(f"mtp.layer must be one of {LAYER_CODES[:-1]}")
+        types, start = self.layer_types, self.cross_start
+        if start < self.num_layers:
+            if start == 0 or CROSS_ATTENTION in types[:start] or set(types[start:]) != {CROSS_ATTENTION}:
+                raise ValueError(f"cross-decoder ('X') blocks must be the last blocks after at least one other, "
+                                 f"got {''.join(types)} (write the pattern out in full, e.g. LLLLXXXX)")
+            if self.loop.core:
+                raise ValueError("a cross-decoder cannot be combined with a looped core")
+            if self.cross.kv == "layer" and GLOBAL_ATTENTION not in types[:start]:
+                raise ValueError("cross.kv=layer needs a global ('G') layer in the self-decoder")
         loop = self.loop
         if loop.core < 0 or loop.prelude < 0 or loop.prelude + loop.core > self.num_layers:
             raise ValueError(f"need loop.core, loop.prelude >= 0 and prelude + core <= num_layers ({self.num_layers})")
@@ -171,6 +203,28 @@ class ModelConfig:
     @property
     def layer_types(self) -> list[str]:
         return [self.layer_pattern[i % len(self.layer_pattern)] for i in range(self.num_layers)]
+
+    @property
+    def cross_start(self) -> int:
+        """Index of the first cross-decoder block (num_layers without one)."""
+        types = self.layer_types
+        return types.index(CROSS_ATTENTION) if CROSS_ATTENTION in types else self.num_layers
+
+    @property
+    def cross_kv_layer(self) -> int | None:
+        """Block whose attention keys / values the cross-decoder reuses (cross.kv=layer)."""
+        if self.cross_start == self.num_layers or self.cross.kv != "layer":
+            return None
+        return max(i for i, t in enumerate(self.layer_types[: self.cross_start]) if t == GLOBAL_ATTENTION)
+
+    @property
+    def cross_rope(self) -> bool:
+        """Whether the shared keys (hence the cross-decoder queries) are rotated."""
+        rope = self.attention.global_rope
+        global_layers = [i for i, t in enumerate(self.layer_types) if t == GLOBAL_ATTENTION]
+        source = self.cross_kv_layer
+        first = (source == global_layers[0]) if source is not None else not global_layers
+        return rope == "all" or (rope == "first" and first)
 
     @property
     def effective_layers(self) -> int:
