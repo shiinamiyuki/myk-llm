@@ -1,7 +1,7 @@
 # Decoder-decoder (YOCO)
 
 Status (2026-11-09): implemented (`model.cross`, "X" blocks, looped cross-decoder);
-E1-E6 done; E6 follow-ups on 1-6 hop training running.
+E1-E6 done.
 
 Summary:
 - Quality: free at this scale. Single-hop retrieval is perfect to 64K (E1); multi-hop
@@ -18,7 +18,9 @@ Summary:
   best multi-hop model so far: 100% on 1-4 hops in all 4 runs, against 85% for LLLLXXXX
   and 77% for the looped DG core of notes/loop.md at 4 hops. Past the 1-4 hop training
   it answers 5 hops at 90-98% and 6 hops at 58-68%. Unlike the DG loop, a fixed r = 4
-  extrapolates as well as random r. 1-6 hops from scratch did not learn. r costs decode
+  extrapolates as well as random r. 1-6 hops from scratch did not learn, with random or
+  fixed r. Continuing the 1-4 hop models on 1-6 hops did: 96-100% on 1-6 hops, 94% on 7
+  and 84% on 8 (the looped DG core after the same curriculum: 62 / 44%). r costs decode
   time (r full-context reads per token, like r "X" blocks), not cache or prefill (E6).
 
 Question: split the stack in two halves, where the second half has no keys / values of
@@ -319,9 +321,50 @@ is within 5 points of 2K on 1-5 hops, 6 hops lose up to 10 (r2to10, r = 10: 99 /
   same lookup; the DG core instead re-encodes the whole context every iteration.
 - **1-6 hops from scratch did not learn at all**, not even the 1-hop chains. The looped
   DG core learned 1 hop in that setting, and yoco-split's LLXXXXXX (six distinct cross
-  blocks) learned 1-6 hops. Follow-ups running: the loop-curriculum recipe (continue
-  r2to10 on 1-6 hops, `yoco-loop-curriculum.yaml`) and a fixed r = 6 from scratch
-  (`h6r6`).
+  blocks) learned 1-6 hops. A fixed r = 6 does not help either (`h6r6`, below).
+
+Follow-up on 1-6 hops (`yoco-loop-curriculum.yaml`, and the `h6r6` arm of
+`yoco-loop.yaml`):
+- `h6r6`: fixed r = 6 on 1-6 hops from scratch, 24000 steps. At chance on every hop count
+  in both seeds (loss 0.096 / 0.098, as h6r2to10). Fixed r learned 1-4 hops sooner than
+  random r, but it does not make 1-6 hops learnable from scratch.
+- Curriculum, as loop-curriculum.yaml did for the DG core: continue the final r2to10
+  model of each seed for 16000 steps with a fresh optimizer and schedule, on 1-6 hops
+  (h6, min_len 320) or on 1-4 hops again (h4, the control for the extra training). The
+  scan adds 7 hops and r = 7. 14.5 min per run.
+
+Both h6 seeds crossed 90% within 1000 steps (the DG core: 3000-12500). Final accuracy at
+2K on 1-6 hops: s0 99 / 99 / 98 / 98 / 97 / 95, s1 100 / 100 / 100 / 99 / 100 / 100;
+512-16K all 97-100%. Final scan at 2K, mean of 2 seeds (12 hops at chance everywhere):
+
+| arm | r | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| start (r2to10 above) | 10 | 100 | 100 | 100 | 98 | 92 | 58 | | 22 | 17 |
+| h4 | 10 | 100 | 100 | 99 | 99 | 94 | 58 | 29 | 21 | 18 |
+| h6 | 4 | 100 | 98 | 97 | 97 | 25 | 17 | 15 | 16 | 18 |
+| h6 | 6 | 100 | 98 | 97 | 97 | 98 | 96 | 23 | 20 | 16 |
+| h6 | 7 | 100 | 98 | 97 | 98 | 98 | 96 | 94 | 25 | 17 |
+| h6 | 8 | 100 | 98 | 97 | 98 | 98 | 96 | 94 | 84 | 15 |
+| h6 | 10 | 100 | 98 | 97 | 98 | 99 | 96 | 93 | 83 | 24 |
+| h6 | 24 | 99 | 98 | 97 | 98 | 99 | 96 | 94 | 76 | 28 |
+| DG core h6 (notes/loop.md, 4 seeds) | 8 | 100 | 95 | 93 | 89 | 89 | 81 | 62 | 44 | |
+
+Per seed, h6: 7 hops at r = 7: 90 / 97; 8 hops at r = 8: 78 / 90. At 8K, h6 at r = 8 is
+99 / 99 / 97 / 99 / 98 / 97 / 93 / 79.
+
+- **The curriculum extends the reach by the two hops it adds.** Trained on 1-4 hops, the
+  model answers 5 hops at about 92% and 6 at about 58%. Trained on 1-6, it answers 7 at
+  94% and 8 at 84%. 10 hops stay near chance (15-32%). h4, the same extra training on
+  1-4 hops, leaves 5-8 hops where they were, so the gain comes from the longer chains.
+- **Still one iteration per hop**, now up to 8 (r = 7: 94% on 7 hops, 25% on 8), and
+  stable to r = 24 except on 8 hops (84 -> 76).
+- **Ahead of the DG core after the same curriculum** on 2-8 hops (r = 8:
+  94 / 84 vs 62 / 44% on 7 / 8 hops), with 2 seeds against 4.
+- From scratch, long chains are not learnable at this budget with random or fixed r.
+  The cross loop needs the curriculum; six distinct cross blocks did not (E4).
+- Next, if this line continues: whether the reach keeps growing by two hops per stage
+  (1-8 -> 9 and 10 hops), and whether a 1-2 -> 1-4 -> 1-6 schedule from scratch replaces
+  the separate runs.
 
 Cost (`runs/yoco-loop-bench.md`, E5 setup: ngram-small shape, random weights, static-cache
 CUDA-graph decode). `LLLL(X)xr` has 19.0M non-embedding parameters, against 30.0M for
