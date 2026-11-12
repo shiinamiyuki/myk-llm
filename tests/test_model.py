@@ -41,6 +41,9 @@ VARIANTS = {
     "yoco_loop_truncated": {"layer_pattern": "LLXX", "loop.prelude": "2", "loop.core": "2", "loop.iterations": "3",
                             "loop.train_iterations": "[2, 4]", "loop.backprop_iterations": "2"},
     "yoco_self_loop": {"layer_pattern": "LLXX", "loop.core": "2", "loop.iterations": "2"},
+    "parallel": {"parallel_block": "true"},
+    "parallel_deltanet_loop": {"parallel_block": "true", "layer_pattern": "DDDG", "loop.core": "4", "loop.iterations": "2"},
+    "parallel_yoco_gated": {"parallel_block": "true", "layer_pattern": "LLXX", "residual.gate": "input"},
 }
 
 LOOP = {"loop.prelude": "1", "loop.core": "2", "loop.iterations": "3"}  # blocks 1-2 looped, block 3 the coda
@@ -98,6 +101,19 @@ def test_gates_start_as_the_baseline():
     base.load_state_dict(state)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         assert kl(base.logits(base(ids).hidden), gated.logits(gated(ids).hidden)) < 1e-4
+
+
+@torch.no_grad()
+def test_parallel_block_adds_mixer_and_ffn_of_one_norm():
+    """Parallel block == x + mixer(norm(x)) + ffn(norm(x)), and it has no FFN norm."""
+    block = build(parallel_block="true").layers[1]
+    assert block.ffn_norm is None
+    x = torch.randn(2, 32, 128, device="cuda")
+    positions = torch.arange(32, device="cuda").expand(2, -1)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        h = block.mixer_norm(x)
+        expected = x + block.mixer(h, positions)[0] + block.ffn(h)
+        torch.testing.assert_close(block(x, positions)[0], expected)
 
 
 def test_ngram_hash_depends_only_on_the_ngram():

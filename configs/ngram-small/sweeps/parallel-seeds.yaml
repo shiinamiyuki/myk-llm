@@ -1,0 +1,20 @@
+# Second seed (s1) for parallel.yaml: the sequential / parallel gap at r = 1 was 0.010 bpb
+# for LLLG and 0.005 for DDDG on seed 0, the latter at the edge of the testbed's seed
+# spread. Same name, so the runs land in runs/sweeps/parallel-lm and its report averages
+# the seeds.
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/parallel-seeds.yaml --report
+name: parallel-lm
+overrides: [logging.tensorboard=false, model.deltanet.num_heads=4, model.deltanet.head_dim=128]
+configs:
+  v64k: configs/ngram-small/v64k.yaml
+axes:
+  loop:
+    r1: []
+  pattern:
+    LLLG: [model.layer_pattern=LLLG]
+    DDDG: [model.layer_pattern=DDDG]
+  block:
+    seq: []
+    par: [model.parallel_block=true]
+  seed:
+    s1: [seed=1]

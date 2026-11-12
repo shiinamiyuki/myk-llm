@@ -28,7 +28,8 @@ from .mixers import Attention, SharedKV, Varlen, build_mixer
 
 
 class Block(nn.Module):
-    """Pre-norm block: x + g1 * mixer(norm(x)), then x + g2 * ffn(norm(x))."""
+    """Pre-norm block: x + g1 * mixer(norm(x)), then x + g2 * ffn(norm(x)); or, with
+    `parallel_block`, x + g1 * mixer(h) + g2 * ffn(h) with h = norm(x) (one norm)."""
 
     def __init__(self, config: ModelConfig, layer_type: str, first_global: bool) -> None:
         super().__init__()
@@ -36,7 +37,7 @@ class Block(nn.Module):
         self.mixer_norm = RMSNorm(config.hidden_size, config.norm_eps)
         self.mixer = build_mixer(config, layer_type, first_global)
         self.mixer_gate = ResidualGate(config.residual, config.hidden_size)
-        self.ffn_norm = RMSNorm(config.hidden_size, config.norm_eps)
+        self.ffn_norm = None if config.parallel_block else RMSNorm(config.hidden_size, config.norm_eps)
         self.ffn = SwiGLU(config)
         self.ffn_gate = ResidualGate(config.residual, config.hidden_size)
         self.activation_checkpointing = False  # recompute this block in backward
@@ -62,6 +63,8 @@ class Block(nn.Module):
     ) -> tuple[torch.Tensor, Any]:
         h = self.mixer_norm(x)
         update, state = self.mixer(h, position_ids, varlen, state, use_cache)
+        if self.ffn_norm is None:  # parallel: the FFN reads the mixer's input, not its output
+            return self.ffn_gate(self.mixer_gate(x, update, h), self.ffn(h), h), state
         x = self.mixer_gate(x, update, h)
         h = self.ffn_norm(x)
         x = self.ffn_gate(x, self.ffn(h), h)

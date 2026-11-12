@@ -8,7 +8,7 @@ src/myk_llm/
   configuration.py   YAML -> typed dataclass configs (`base:` inheritance, key=value overrides)
   model/             config, embeddings (token + hashed n-gram), mixers (attention / Gated DeltaNet /
                      YOCO cross-attention), layers (norm, SwiGLU, RoPE, residual gates),
-                     transformer (+ MTP, looped core, decoder-decoder), generation, io
+                     transformer (+ MTP, looped core, decoder-decoder, parallel blocks), generation, io
   ops/fused_ce.py    fused linear + cross-entropy (+ z-loss) Triton kernel
   ops/flash_attn.py  FlashAttention forward/backward Triton kernels (varlen, sliding window, GQA, KV cache)
   data/              pre-tokenized shards, streaming, SFT packing, document filter

@@ -158,6 +158,10 @@ class ModelConfig:
     num_layers: int = 9
     layer_pattern: str = "GL"
     max_seq_len: int = 4096
+    # Parallel blocks (GPT-J, PaLM): mixer and FFN read the same normed input and both
+    # updates join the residual stream at once, x + mixer(norm(x)) + ffn(norm(x)), one
+    # norm per block; instead of the sequential x + mixer(norm(x)), then + ffn(norm(x)).
+    parallel_block: bool = False
     norm_eps: float = 1e-6
     tie_embeddings: bool = True
     initializer_range: float = 0.02
