@@ -162,6 +162,11 @@ class ModelConfig:
     # updates join the residual stream at once, x + mixer(norm(x)) + ffn(norm(x)), one
     # norm per block; instead of the sequential x + mixer(norm(x)), then + ffn(norm(x)).
     parallel_block: bool = False
+    # Parallel blocks at inference (CUDA, autograd off): the FFN runs on a second CUDA
+    # stream, concurrently with the mixer. Pays off when the GPU, not the CPU, is the
+    # bottleneck: compiled blocks in a CUDA graph (decode) or long prefills; slower in
+    # eager, launch-bound decoding (notes/parallel.md).
+    parallel_streams: bool = False
     norm_eps: float = 1e-6
     tie_embeddings: bool = True
     initializer_range: float = 0.02

@@ -44,6 +44,8 @@ VARIANTS = {
     "parallel": {"parallel_block": "true"},
     "parallel_deltanet_loop": {"parallel_block": "true", "layer_pattern": "DDDG", "loop.core": "4", "loop.iterations": "2"},
     "parallel_yoco_gated": {"parallel_block": "true", "layer_pattern": "LLXX", "residual.gate": "input"},
+    "parallel_streams": {"parallel_block": "true", "parallel_streams": "true", "layer_pattern": "GDXX",
+                         "attention.output_gate": "true"},
 }
 
 LOOP = {"loop.prelude": "1", "loop.core": "2", "loop.iterations": "3"}  # blocks 1-2 looped, block 3 the coda
@@ -114,6 +116,29 @@ def test_parallel_block_adds_mixer_and_ffn_of_one_norm():
         h = block.mixer_norm(x)
         expected = x + block.mixer(h, positions)[0] + block.ffn(h)
         torch.testing.assert_close(block(x, positions)[0], expected)
+
+
+@torch.no_grad()
+def test_parallel_streams_match_one_stream_also_in_a_cuda_graph():
+    """FFN on a side stream == one stream, eagerly and captured in a CUDA graph."""
+    model = build(parallel_block="true", layer_pattern="GD", **{"attention.output_gate": "true"})
+    ids = torch.randint(0, 500, (2, 64), device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        reference = model(ids).hidden
+        for block in model.layers:
+            block.streams = True
+        torch.testing.assert_close(model(ids).hidden, reference, rtol=0, atol=0)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            model(ids)  # warm up (Triton autotuning) outside the capture
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = model(ids).hidden
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, reference, rtol=0, atol=0)
 
 
 def test_ngram_hash_depends_only_on_the_ngram():

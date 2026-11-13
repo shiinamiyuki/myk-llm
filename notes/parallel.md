@@ -1,8 +1,9 @@
 # Parallel blocks
 
-Status (2026-11-13): implemented (`model.parallel_block`); small-LM sweep done
-(`configs/ngram-small/sweeps/parallel.yaml`, `parallel-seeds.yaml`); multi-hop chain
-sweep done (`configs/lc/sweeps/parallel-chain.yaml`, `parallel-chain-seeds.yaml`).
+Status (2026-11-13): implemented (`model.parallel_block`, `model.parallel_streams`);
+small-LM sweep done (`configs/ngram-small/sweeps/parallel.yaml`, `parallel-seeds.yaml`);
+multi-hop chain sweep done (`configs/lc/sweeps/parallel-chain.yaml`,
+`parallel-chain-seeds.yaml`); speed measured (training and inference, one RTX 5090).
 
 Question: (1) how much language-modeling quality does a parallel block lose against the
 sequential one, for a sliding-window hybrid (LLLG) and a Gated DeltaNet hybrid (DDDG)?
@@ -20,12 +21,20 @@ Summary:
   from the first extra iteration than the sequential one does (LLLG -0.0125 vs -0.0029,
   DDDG -0.0057 vs -0.0011); after it, both gain about the same per iteration. Parallel
   r = 2 also beats sequential r = 1 (by 0.001), parallel r = 3 by 0.004 / 0.0065.
-- **It is not a good trade for speed**: unfused, the parallel block runs at the same
-  speed as the sequential one here, and r = 2 costs 1.5x the training time (r = 3: 2x),
-  so at equal cost the sequential block is never worse. The reading is the other way
-  round: in a looped model the parallel block is about free, so a looped model can take
-  its speedups (fused input projections, attention and FFN at the same time, less
-  communication under tensor parallelism) at no visible quality cost.
+- **It is not a good trade for training speed**: the parallel block trains at the
+  sequential block's speed (fusing its input matmuls does not help on one GPU, see
+  Speed), and r = 2 costs 1.5x the training time (r = 3: 2x), so at equal cost the
+  sequential block is never worse. The reading is the other way round: in a looped
+  model the parallel block is about free, so a looped model can take its inference
+  speedup (decoding 8-16% faster with the FFN on a second CUDA stream) and, under tensor
+  parallelism, its saved communication at no visible quality cost.
+- **Speed**: fusing the mixer's and the FFN's input matmuls (general matrix multiply
+  (GEMM) fusion) cannot speed up training on one GPU (the matmuls are already at peak:
+  < 0.5% to gain) and made it 5-7.5% slower (the backward concatenates the gradients),
+  so it was dropped. Running the FFN on a second CUDA stream (`model.parallel_streams`)
+  makes CUDA-graph decoding 8-16% faster than one stream from 30M to 1.5B non-embedding
+  parameters (1% for DDDG at batch 32, hidden 2048), but eager, launch-bound decoding
+  10-20% slower, so it is off by default.
 - **Multi-hop chains tell the same story through seed noise**: unlooped, the parallel
   block learned direct 1-4-hop answers within 24000 steps in 1 of 8 runs against 3 of 8
   sequential runs (not significant; mean 2-4-hop accuracy about equal). Looped, every
@@ -42,9 +51,9 @@ parallel:              h = norm(x);  x = x + mixer(h) + ffn(h)
 
 GPT-J / PaLM style: one RMSNorm per block (no FFN norm); residual gates (`model.residual`)
 apply to each update as before. Applies to every block (mixer type, looped core,
-cross-decoder, MTP module). The input projections of mixer and FFN are not fused, so
-there is no speedup yet: identical tokens/s at this size, 0.5-2 GB less activation
-memory.
+cross-decoder, MTP module). Same training tokens/s as the sequential block, 0.5-2 GB
+less activation memory; at inference `model.parallel_streams` runs the FFN on a second
+CUDA stream (see Speed).
 
 ## Setup
 
@@ -204,6 +213,113 @@ Readings:
 - Caveats: 2 seeds for r = 2 / 3 (4 for r = 1), learning at r = 1 is seed-dependent
   and unfinished at 24000 steps, one model size, 1-4 training hops only.
 
-Next: fuse the mixer and FFN input projections to measure the parallel block's actual
-speedup; whether a partial loop (e.g. a middle core with prelude / coda) also closes the
-gap.
+## Speed (2026-11-13)
+
+How much faster can a parallel block train and decode on one RTX 5090? Training: one
+matmul for the mixer's and the FFN's input projections (GEMM fusion, PaLM's speed
+argument besides tensor parallelism); inference: the mixer and the FFN on two CUDA
+streams. Without either, the parallel block trains at the sequential block's speed and
+decodes 1-3% faster in a CUDA graph (one RMSNorm less per block).
+
+### Training: GEMM fusion (tested, dropped)
+
+The tested version (not kept) concatenated the weights of the mixer's input projections
+(attention q / k / v and output gate; Gated DeltaNet q / k / v / a / b / g) and the FFN's
+up / gate projection on the fly, ran one matmul and split the result; the parameters,
+checkpoints and Muon's per-matrix updates were unchanged, and Gated DeltaNet ran fla's
+kernels from the projected columns. Outputs were bit-identical to separate matmuls,
+gradients within 0.7% (bf16 rounding).
+
+Small-LM testbed (32 x 2048 tokens per micro-batch, compiled blocks), training tokens/s:
+
+| pattern | sequential | parallel | parallel, fused |
+|---|---|---|---|
+| LLLG | 355K | 354K | 328K (-7.5%) |
+| DDDG | 280K | 280K | 266K (-5%) |
+
+Separate vs fused input matmuls (q / k / v + SwiGLU up / gate at the FFN width 4x hidden;
+bf16), time saved by fusing, per token count M:
+
+| hidden | M = 1 | 8 | 64 | 512 | 4096 | 65536 |
+|---|---|---|---|---|---|---|
+| 512 | 43% | 46% | 37% | 25% | 13% | 0.4% |
+| 1024 | 16% | 39% | 31% | 20% | 7% | 0.5% |
+| 2048 | 54% | 23% | 32% | 12% | 3.5% | 0.0% |
+
+- At training token counts (65K per micro-batch) the matmuls run near the GPU's peak
+  whether fused or not; profiling one LLLG block (forward + backward), the matmuls take
+  6.8 ms per step either way.
+- The fused backward needs the gradients of all parts as one contiguous matrix; autograd
+  assembles it with one extra copy kernel per block (0.83 ms, against 0.12 ms for the
+  attention's own q / k / v concatenation), which is the whole slowdown. A custom
+  backward that keeps the parts separate would only remove the loss: the ceiling is the
+  < 0.5% of the forward matmul.
+- Fusion pays for few tokens (decoding: 15-55%), but only with weights stored merged:
+  concatenating them on every call cost more than it saved from hidden 1024 (hidden 2048
+  LLLG decode 2.60 -> 4.08 ms), since decoding is bound by reading the weights. Merged
+  inference weights (as inference engines load them) are not implemented. With two
+  streams, fusing across mixer and FFN also removes their overlap (the fused matmul has
+  to finish before either branch starts).
+
+### Inference: two CUDA streams (`model.parallel_streams`)
+
+At inference (CUDA, autograd off) a parallel block launches the FFN on a side stream that
+first waits for the current one, runs the mixer on the current stream, then joins the
+two. torch.compile traces the fork / join into one graph with both streams, and a CUDA
+graph captures them as two branches. Outputs are bit-identical to one stream (eager,
+compiled and in a CUDA graph). Off by default.
+
+Decode (`scripts/benchmark_decode.py --compile`: compiled blocks, one step captured in a
+CUDA graph, 1024 cached tokens, 64K vocabulary, no MTP), ms per step at batch 1 / 32:
+
+| size | pattern | sequential | parallel | parallel + streams | streams vs one |
+|---|---|---|---|---|---|
+| hidden 512, 8 blocks (30-34M) | LLLG | 0.243 / 0.337 | 0.236 / 0.329 | 0.204 / 0.285 | -14 / -13% |
+| | DDDG | 0.266 / 0.446 | 0.261 / 0.436 | 0.220 / 0.403 | -16 / -8% |
+| hidden 1024, 16 blocks (243-275M) | LLLG | 0.786 / 1.164 | 0.776 / 1.151 | 0.685 / 1.042 | -12 / -9% |
+| | DDDG | 0.837 / 1.355 | 0.827 / 1.343 | 0.726 / 1.230 | -12 / -8% |
+| hidden 2048, 24 blocks (1.46-1.65B) | LLLG | 2.606 / 3.555 | 2.582 / 3.521 | 2.215 / 3.021 | -14 / -14% |
+| | DDDG | 2.903 / 3.617 | 2.883 / 3.579 | 2.564 / 3.528 | -11 / -1% |
+
+Non-embedding parameters in brackets. Heads: hidden 512 as the testbed (DeltaNet 4 x
+128); hidden 1024 8 x 128 (2 KV heads), DeltaNet 8 x 128; hidden 2048 16 x 128 (4 KV
+heads), DeltaNet 16 x 128; FFN 4x hidden.
+
+Eager `generate()` (no CUDA graph; prompt 512, 128 greedy tokens), ms per step at batch
+1 / 32:
+
+| size | pattern | sequential | parallel | parallel + streams |
+|---|---|---|---|---|
+| hidden 512 | LLLG | 2.28 / 2.30 | 2.08 / 2.13 | 2.41 / 2.50 |
+| | DDDG | 3.68 / 3.80 | 3.32 / 3.43 | 3.79 / 3.86 |
+| hidden 2048 | LLLG | 6.43 / 8.71 | 5.74 / 7.97 | 6.90 / 9.05 |
+| | DDDG | 10.58 / 13.10 | 9.89 / 12.11 | 11.03 / 13.32 |
+
+Prefill (`scripts/benchmark_prefill.py`, eager as in `generate()`, batch 1), ms at 2K /
+8K / 32K tokens:
+
+| size | pattern | sequential | parallel | parallel + streams |
+|---|---|---|---|---|
+| hidden 512 | LLLG | 2.4 / 5.7 / 31.0 | 2.2 / 5.5 / 30.6 | 2.4 / 5.1 / 29.7 |
+| | DDDG | 6.6 / 8.0 / 35.3 | 6.4 / 7.9 / 35.0 | 6.7 / 7.3 / 33.8 |
+| hidden 2048 | LLLG | 35.2 / 146 / 689 | 35.0 / 145 / 678 | 33.0 / 141 / 675 |
+| | DDDG | 40.7 / 159 / 737 | 40.4 / 158 / 724 | 37.8 / 153 / 718 |
+
+Readings:
+- **Decoding in a CUDA graph is 8-16% faster with two streams** (one exception: DDDG at
+  batch 32, hidden 2048, -1%). A decode step is a chain of small kernels that each fill
+  part of the GPU; the FFN beside the mixer shortens the chain. Against the sequential
+  block that is 10-17% (DDDG batch 32: 2-10%).
+- **Eager decoding is 10-20% slower with two streams**: without a CUDA graph the CPU is
+  the bottleneck (2-13 ms per step against 0.2-3.6 ms in a graph), and each block adds
+  two cross-stream waits to it. Hence off by default; turn it on with CUDA graphs. The
+  parallel block alone decodes 7-11% faster than the sequential one eagerly (the eager
+  RMSNorm it drops is ~6 kernels).
+- **Prefill gains 0.5-8% from 8K tokens** (hidden 512: -7 / -8% at 8K, -3% at 32K;
+  hidden 2048: -3% at 8K, < 1% at 32K, where attention dominates); at 2K tokens hidden
+  512 is launch-bound and streams cost 5-9%, hidden 2048 gains 6%.
+
+Next: merged inference weights (one matmul for the mixer's input projections, also for
+sequential blocks: fusing Gated DeltaNet's six projections alone made hidden-512 DDDG
+decoding 16% faster in a test, with a per-call concatenation that does not scale);
+whether a partial loop (e.g. a middle core with prelude / coda) also closes the gap.

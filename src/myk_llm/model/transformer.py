@@ -27,9 +27,38 @@ from .layers import ResidualGate, RMSNorm, SwiGLU, init_linear_, residual_init_s
 from .mixers import Attention, SharedKV, Varlen, build_mixer
 
 
+_side_streams: dict[int, torch.cuda.Stream] = {}
+
+
+@torch.compiler.disable
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    index = torch.cuda.current_device() if device.index is None else device.index
+    if index not in _side_streams:
+        _side_streams[index] = torch.cuda.Stream(index)
+    return _side_streams[index]
+
+
+def _concurrently(
+    first: Callable[[], Any], second: Callable[[], Any], side: torch.cuda.Stream
+) -> tuple[Any, Any]:
+    """first() on the current CUDA stream, second() on `side`, joined after (compiles
+    into one graph with both streams). Memory second() allocates is freed to the side
+    stream, whose next work waits for the current stream first."""
+    main = torch.cuda.current_stream()
+    side.wait_stream(main)
+    with torch.cuda.stream(side):
+        b = second()
+    a = first()
+    main.wait_stream(side)
+    return a, b
+
+
 class Block(nn.Module):
     """Pre-norm block: x + g1 * mixer(norm(x)), then x + g2 * ffn(norm(x)); or, with
-    `parallel_block`, x + g1 * mixer(h) + g2 * ffn(h) with h = norm(x) (one norm)."""
+    `parallel_block`, x + g1 * mixer(h) + g2 * ffn(h) with h = norm(x) (one norm).
+
+    At inference a parallel block can run the FFN on a second CUDA stream, concurrently
+    with the mixer (`parallel_streams`)."""
 
     def __init__(self, config: ModelConfig, layer_type: str, first_global: bool) -> None:
         super().__init__()
@@ -40,6 +69,7 @@ class Block(nn.Module):
         self.ffn_norm = None if config.parallel_block else RMSNorm(config.hidden_size, config.norm_eps)
         self.ffn = SwiGLU(config)
         self.ffn_gate = ResidualGate(config.residual, config.hidden_size)
+        self.streams = config.parallel_streams
         self.activation_checkpointing = False  # recompute this block in backward
 
     def residual_projections(self) -> list[nn.Linear]:
@@ -62,13 +92,37 @@ class Block(nn.Module):
         self, x: torch.Tensor, position_ids: torch.Tensor, varlen: Varlen | None, state: Any, use_cache: bool
     ) -> tuple[torch.Tensor, Any]:
         h = self.mixer_norm(x)
-        update, state = self.mixer(h, position_ids, varlen, state, use_cache)
         if self.ffn_norm is None:  # parallel: the FFN reads the mixer's input, not its output
-            return self.ffn_gate(self.mixer_gate(x, update, h), self.ffn(h), h), state
+            (update, state), ffn_out = self._parallel(h, position_ids, varlen, state, use_cache)
+            return self.ffn_gate(self.mixer_gate(x, update, h), ffn_out, h), state
+        update, state = self.mixer(h, position_ids, varlen, state, use_cache)
         x = self.mixer_gate(x, update, h)
         h = self.ffn_norm(x)
         x = self.ffn_gate(x, self.ffn(h), h)
         return x, state
+
+    def side_stream(self, device: torch.device) -> torch.cuda.Stream:
+        # Fetched once per block outside compiled code (a graph break here would split the
+        # stream fork / join across graphs).
+        stream = self.__dict__.get("_side_stream")
+        if stream is None:
+            stream = self.__dict__["_side_stream"] = _side_stream(device)
+        return stream
+
+    def _parallel(
+        self, h: torch.Tensor, position_ids: torch.Tensor, varlen: Varlen | None, state: Any, use_cache: bool
+    ) -> tuple[tuple[torch.Tensor, Any], torch.Tensor]:
+        """(mixer(h), ffn(h)) of a parallel block."""
+
+        def mixer() -> tuple[torch.Tensor, Any]:
+            return self.mixer(h, position_ids, varlen, state, use_cache)
+
+        def ffn() -> torch.Tensor:
+            return self.ffn(h)
+
+        if self.streams and h.is_cuda and not torch.is_grad_enabled():
+            return _concurrently(mixer, ffn, self.side_stream(h.device))
+        return mixer(), ffn()
 
 
 class MTPModule(nn.Module):
