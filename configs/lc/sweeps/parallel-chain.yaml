@@ -1,0 +1,30 @@
+# Parallel blocks on multi-hop chains (notes/parallel.md): the small LM lost 0.011 (LLLG) /
+# 0.005 (DDDG) bpb with parallel blocks and won it back by looping the stack 2-3 times.
+# Does the parallel block, whose FFN cannot read its own block's mixer output, cost
+# direct multi-hop answers (which depend on serial depth, notes/lc-retrieval.md E3), and
+# does the loop repair that too?
+# E3b's direct chain setting: 1-4 hops, NoPE global layers, 24000 steps; E3b learned
+# DDDG at 21500 steps, LLLG at 14000 (one seed each). Patterns tile over the 8 blocks
+# (LLLGLLLG, DDDGDDDG); the loop runs the whole stack r times (fixed r, add injection,
+# same parameters). Learning on this task is all-or-nothing and seed-dependent, so
+# every arm has 2 seeds; runs are ordered by loop count (r = 1 first).
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/parallel-chain.yaml --report --at 2048
+name: parallel-chain
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [steps=24000, task.cot=false, model.attention.global_rope=none,
+            "task.eval_hops=[1, 2, 3, 4, 5, 6]", "scan_lengths=[2048, 8192]"]
+axes:
+  loop:
+    r1: []
+    r2: [model.loop.core=8, model.loop.iterations=2]
+    r3: [model.loop.core=8, model.loop.iterations=3]
+  pattern:
+    LLLG: [model.layer_pattern=LLLG]
+    DDDG: [model.layer_pattern=DDDG]
+  block:
+    seq: []
+    par: [model.parallel_block=true]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]

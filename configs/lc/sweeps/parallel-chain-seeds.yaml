@@ -1,0 +1,22 @@
+# Seeds 2 and 3 for parallel-chain.yaml's r = 1 arms: with seeds 0 / 1, multi-hop was
+# learned in 1 of 2 runs for LLLG seq, DDDG seq and LLLG par (+ a partial one) and in 0
+# of 2 for DDDG par (2 hops partly), too few to compare rates. Same name, so the runs land
+# in runs/lc/parallel-chain and its report averages the seeds.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/parallel-chain.yaml --report --at 2048
+name: parallel-chain
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [steps=24000, task.cot=false, model.attention.global_rope=none,
+            "task.eval_hops=[1, 2, 3, 4, 5, 6]", "scan_lengths=[2048, 8192]"]
+axes:
+  loop:
+    r1: []
+  pattern:
+    LLLG: [model.layer_pattern=LLLG]
+    DDDG: [model.layer_pattern=DDDG]
+  block:
+    seq: []
+    par: [model.parallel_block=true]
+  seed:
+    s2: [seed=2]
+    s3: [seed=3]

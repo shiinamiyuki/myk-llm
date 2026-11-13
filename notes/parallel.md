@@ -1,11 +1,13 @@
 # Parallel blocks
 
-Status (2026-11-12): implemented (`model.parallel_block`); small-LM sweep done
-(`configs/ngram-small/sweeps/parallel.yaml`, `parallel-seeds.yaml`).
+Status (2026-11-13): implemented (`model.parallel_block`); small-LM sweep done
+(`configs/ngram-small/sweeps/parallel.yaml`, `parallel-seeds.yaml`); multi-hop chain
+sweep done (`configs/lc/sweeps/parallel-chain.yaml`, `parallel-chain-seeds.yaml`).
 
 Question: (1) how much language-modeling quality does a parallel block lose against the
 sequential one, for a sliding-window hybrid (LLLG) and a Gated DeltaNet hybrid (DDDG)?
-(2) Does looping the stack 2 or 3 times (notes/loop.md) win it back?
+(2) Does looping the stack 2 or 3 times (notes/loop.md) win it back? Then both
+questions again on direct multi-hop chains, which need serial depth.
 
 Summary:
 - **The parallel block costs bits per byte (bpb)**: +0.011 for LLLG, +0.005 for DDDG
@@ -24,6 +26,12 @@ Summary:
   round: in a looped model the parallel block is about free, so a looped model can take
   its speedups (fused input projections, attention and FFN at the same time, less
   communication under tensor parallelism) at no visible quality cost.
+- **Multi-hop chains tell the same story through seed noise**: unlooped, the parallel
+  block learned direct 1-4-hop answers within 24000 steps in 1 of 8 runs against 3 of 8
+  sequential runs (not significant; mean 2-4-hop accuracy about equal). Looped, every
+  run of both blocks learns: r = 2 at 7500-18000 steps (4 hops 78-99%), r = 3 at
+  3500-9000 (95-100%), and the two blocks cannot be told apart. A fixed loop does not
+  extrapolate hops (5 hops 21-75%, 6 hops mostly at chance).
 
 ## Model (`ModelConfig.parallel_block`)
 
@@ -112,6 +120,90 @@ finished run validates its final checkpoint); 16 x 16 rows reproduce 8 x 32 exac
 `results-eval128.json` / `train-original.log` in `runs/sweeps/parallel-lm/`. Keep
 `eval.batches x micro_batch_size` fixed across a sweep.
 
+## Multi-hop chains (2026-11-13)
+
+`configs/lc/sweeps/parallel-chain.yaml` (r = 1 seeds 2-3: `parallel-chain-seeds.yaml`):
+does the parallel block cost direct multi-hop answers, which depend on serial depth
+(notes/lc-retrieval.md E3, notes/loop.md), and does the loop repair that too? E3b's
+direct chain setting: 8 chains of 1-4 hops in noise, 4 queried, answers without
+intermediate keys, trained on 256-2048 tokens, NoPE global layers, 24000 steps, on the
+lc testbed (hidden 256, 8 blocks; 8.4M / 8.8M non-embedding parameters for LLLG / DDDG).
+The loop is the one above (whole stack, add injection, fixed r). The final scan
+evaluates 1-6 hops at 2K and 8K; chance is ~15-20%. Minutes per run (parallel =
+sequential): LLLG 16 / 31 / 45, DDDG 24 / 44 / 65 for r = 1 / 2 / 3. Full tables:
+`runs/lc/parallel-chain/summary.md`.
+
+Final accuracy at 2K per hop count (1 / 2 / 3 / 4) per seed; "learned" = first
+evaluation at >= 90% overall:
+
+| arm | r | seed 0 | seed 1 | learned |
+|---|---|---|---|---|
+| LLLG seq | 2 | 100 / 100 / 98 / 88 | 100 / 100 / 100 / 99 | 14000, 8000 |
+| LLLG par | 2 | 100 / 100 / 99 / 97 | 100 / 100 / 100 / 97 | 12000, 7500 |
+| DDDG seq | 2 | 100 / 98 / 96 / 78 | 100 / 99 / 96 / 90 | 18000, 11500 |
+| DDDG par | 2 | 100 / 99 / 94 / 89 | 100 / 99 / 97 / 93 | 13000, 13000 |
+| LLLG seq | 3 | 100 / 100 / 99 / 96 | 100 / 100 / 100 / 95 | 3500, 3500 |
+| LLLG par | 3 | 100 / 100 / 100 / 99 | 100 / 100 / 100 / 100 | 3500, 8500 |
+| DDDG seq | 3 | 100 / 99 / 98 / 99 | 100 / 100 / 99 / 97 | 5500, 7000 |
+| DDDG par | 3 | 100 / 99 / 99 / 96 | 100 / 100 / 98 / 98 | 8000, 9000 |
+
+r = 1, 4 seeds:
+
+| arm | seed 0 | seed 1 | seed 2 | seed 3 | learned |
+|---|---|---|---|---|---|
+| LLLG seq | 100 / 17 / 18 / 23 | 100 / 97 / 92 / 70 | 100 / 55 / 20 / 19 | 100 / 97 / 95 / 73 | -, 17500, -, 12500 |
+| LLLG par | 100 / 95 / 94 / 66 | 100 / 92 / 71 / 32 | 100 / 88 / 82 / 48 | 100 / 18 / 20 / 19 | 14500, -, -, - |
+| DDDG seq | 99 / 15 / 20 / 17 | 100 / 98 / 93 / 71 | 99 / 89 / 61 / 35 | 100 / 13 / 17 / 18 | -, 22000, -, - |
+| DDDG par | 100 / 60 / 23 / 20 | 100 / 53 / 16 / 16 | 99 / 83 / 66 / 30 | 100 / 59 / 22 / 23 | never |
+
+Final scan at 2K, mean of the seeds (8K is at most 10 points lower). The
+scan contexts also hold 5-6-hop chains, so 1-4 hops score a few points below the
+tables above:
+
+| arm | r | 1 | 2 | 3 | 4 | 5 | 6 | accuracy at 16K |
+|---|---|---|---|---|---|---|---|---|
+| LLLG seq | 1 | 100 | 64 | 56 | 44 | 26 | 19 | 59 |
+| LLLG par | 1 | 100 | 70 | 65 | 37 | 26 | 18 | 59 |
+| DDDG seq | 1 | 99 | 53 | 44 | 28 | 20 | 16 | 53 |
+| DDDG par | 1 | 100 | 59 | 27 | 20 | 19 | 17 | 49 |
+| LLLG seq | 2 | 100 | 98 | 99 | 94 | 52 | 21 | 94 |
+| LLLG par | 2 | 100 | 100 | 100 | 98 | 63 | 25 | 95 |
+| DDDG seq | 2 | 100 | 99 | 93 | 82 | 30 | 18 | 92 |
+| DDDG par | 2 | 100 | 100 | 93 | 89 | 38 | 22 | 94 |
+| LLLG seq | 3 | 100 | 100 | 100 | 96 | 56 | 29 | 96 |
+| LLLG par | 3 | 100 | 100 | 100 | 98 | 58 | 22 | 97 |
+| DDDG seq | 3 | 100 | 99 | 97 | 96 | 43 | 18 | 97 |
+| DDDG par | 3 | 100 | 98 | 97 | 93 | 43 | 36 | 97 |
+
+Readings:
+- **Unlooped, the parallel block may learn more slowly; the seeds decide**: within
+  24000 steps 3 of 8 sequential runs pass 90% (LLLG 2 of 4, DDDG 1 of 4) against 1 of 8
+  parallel runs (LLLG 1, DDDG 0); 3 vs 1 of 8 is not significant (Fisher p = 0.57). Mean
+  accuracy on 2-4 hops (tables above) is about equal: LLLG 60 parallel vs 56
+  sequential, DDDG 39 vs 46. Most runs are mid-transition at 24000 steps (e.g. LLLG par
+  seeds 1-2: 88-92% on 2 hops, 32-48% on 4), so r = 1 measures learning speed at the
+  edge of the budget. DDDG par is the only arm with no failed seed (2 hops 53-83% in
+  all 4) and no learned one.
+- **The loop makes the task learnable and then fast, for both blocks**: at r = 2 all 8
+  runs learn (7500-18000 steps) and reach 78-99% on 4 hops; at r = 3 they learn at
+  3500-9000 steps and reach 95-100%. The learned step falls with r for every arm.
+- **After the loop the parallel block costs nothing**: final accuracy is the same
+  (4 hops at r = 2: parallel 89-97, sequential 78-99; at r = 3: 96-100 vs 95-99), and
+  learning speed goes either way with 2 seeds: at r = 2 the parallel block learns first
+  in 3 of 4 seed pairs, at r = 3 the sequential block learns first or ties in all 4
+  (DDDG by 2000-2500 steps). Parallel r = 2 (16 serial sublayers, like sequential r = 1,
+  at 2x its compute) learns in 4 of 4 runs, sequential r = 1 in 3 of 8.
+- **Little hop extrapolation from a fixed r**: 5 hops reach 21-75% per run with a large
+  seed spread (DDDG par r = 3: 21 / 65) and no ordering between the blocks; r = 3 adds
+  5-13 points over r = 2 on DDDG and -5 to +4 on LLLG. 6 hops stay at <= 27% except
+  DDDG par r = 3 seed 1 (45 / 49% at 2K / 8K) and LLLG seq r = 3 seed 0 (36 / 21%).
+  Same as notes/loop.md: with a fixed r the loop is a weight-tied deep stack;
+  extrapolating hops took random r in training.
+- **Length**: from r = 2 every arm keeps 92-97% to 16K (late accuracy); at r = 1 the
+  learned runs lose up to 20 points on 4 hops from 2K to 8K (LLLG par seed 0: 67 -> 47).
+- Caveats: 2 seeds for r = 2 / 3 (4 for r = 1), learning at r = 1 is seed-dependent
+  and unfinished at 24000 steps, one model size, 1-4 training hops only.
+
 Next: fuse the mixer and FFN input projections to measure the parallel block's actual
 speedup; whether a partial loop (e.g. a middle core with prelude / coda) also closes the
-gap; the lc chain task (notes/loop.md), where serial depth decides the hop reach.
+gap.
