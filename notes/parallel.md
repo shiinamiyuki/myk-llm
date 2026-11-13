@@ -2,8 +2,9 @@
 
 Status (2026-11-13): implemented (`model.parallel_block`, `model.parallel_streams`);
 small-LM sweep done (`configs/ngram-small/sweeps/parallel.yaml`, `parallel-seeds.yaml`);
-multi-hop chain sweep done (`configs/lc/sweeps/parallel-chain.yaml`,
-`parallel-chain-seeds.yaml`); speed measured (training and inference, one RTX 5090).
+multi-hop chain sweeps done (`configs/lc/sweeps/parallel-chain.yaml`,
+`parallel-chain-seeds.yaml`, `parallel-chain-cot.yaml`); speed measured (training and
+inference, one RTX 5090).
 
 Question: (1) how much language-modeling quality does a parallel block lose against the
 sequential one, for a sliding-window hybrid (LLLG) and a Gated DeltaNet hybrid (DDDG)?
@@ -41,6 +42,12 @@ Summary:
   run of both blocks learns: r = 2 at 7500-18000 steps (4 hops 78-99%), r = 3 at
   3500-9000 (95-100%), and the two blocks cannot be told apart. A fixed loop does not
   extrapolate hops (5 hops 21-75%, 6 hops mostly at chance).
+- **With chain-of-thought (CoT) answers the parallel block costs nothing, unlooped**:
+  writing each intermediate key turns a k-hop chain into k one-hop lookups, so serial
+  depth no longer matters. Parallel and sequential learn at the same step (LLLG 1500,
+  DDDG 1000, both seeds), score 100% on 1-4 hops to 16K, and both extrapolate to 8 hops
+  (97-100% at 2K and 8K). Unlooped CoT beats every looped direct-answer run, in
+  1000-1500 steps against 3500-18000.
 
 ## Model (`ModelConfig.parallel_block`)
 
@@ -212,6 +219,47 @@ Readings:
   learned runs lose up to 20 points on 4 hops from 2K to 8K (LLLG par seed 0: 67 -> 47).
 - Caveats: 2 seeds for r = 2 / 3 (4 for r = 1), learning at r = 1 is seed-dependent
   and unfinished at 24000 steps, one model size, 1-4 training hops only.
+
+### With chain-of-thought answers
+
+`configs/lc/sweeps/parallel-chain-cot.yaml`: the same chains, but the answer writes every
+intermediate key before the value (E3's CoT setting: `task.cot`, NoPE global layers, 8000
+steps), unlooped, 2 seeds. Each written key is one single-hop lookup, so the question is
+only whether the parallel block learns the lookup-and-copy as fast. The final scan
+evaluates 1-8 hops (training has 1-4); evaluation is teacher-forced exact match on the
+whole answer, which equals greedy decoding. Minutes per run (parallel = sequential):
+LLLG 5.6, DDDG 8.0. Full tables: `runs/lc/parallel-chain-cot/summary.md`.
+
+Final scan per seed, accuracy for 1 / 2 / ... / 8 hops; "learned" = first evaluation at
+>= 90% overall:
+
+| arm | seed | 2K | 8K | learned |
+|---|---|---|---|---|
+| LLLG seq | 0 | 100 / 100 / 100 / 99 / 100 / 100 / 99 / 98 | 100 / 100 / 100 / 100 / 98 / 100 / 100 / 99 | 1500 |
+| LLLG seq | 1 | 100 / 100 / 100 / 99 / 100 / 100 / 100 / 98 | 100 / 100 / 100 / 99 / 99 / 100 / 98 / 100 | 1500 |
+| LLLG par | 0 | 100 / 100 / 100 / 100 / 100 / 100 / 100 / 97 | 100 / 100 / 100 / 98 / 100 / 100 / 99 / 100 | 1500 |
+| LLLG par | 1 | 100 / 99 / 100 / 100 / 100 / 100 / 99 / 97 | 100 / 100 / 100 / 100 / 100 / 100 / 99 / 99 | 1500 |
+| DDDG seq | 0 | 100 / 100 / 100 / 100 / 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 / 100 / 99 / 100 / 100 | 1000 |
+| DDDG seq | 1 | 100 / 100 / 100 / 100 / 100 / 100 / 100 / 97 | 100 / 100 / 100 / 100 / 100 / 99 / 98 / 100 | 1000 |
+| DDDG par | 0 | 100 / 100 / 100 / 100 / 100 / 99 / 100 / 98 | 100 / 100 / 100 / 100 / 100 / 100 / 99 / 100 | 1000 |
+| DDDG par | 1 | 100 / 100 / 100 / 100 / 100 / 100 / 100 / 97 | 100 / 100 / 100 / 100 / 100 / 100 / 100 / 98 | 1000 |
+
+Readings:
+- **Parallel = sequential**: the same learned step in every seed pair (LLLG 1500, DDDG
+  1000, as E3's sequential runs), 100% on 1-4 hops from 512 to 16K tokens (final and
+  late accuracy), 97-100% on every hop count in the scan. Nothing separates the blocks.
+- **CoT extrapolates hops, the loop does not**: 5-8 hops, never trained, stay at
+  97-100% at 2K and 8K, against 21-75% (5 hops) and mostly chance (6 hops) for the
+  direct answers at r = 2 / 3. Each step of the written chain is the same one-hop
+  lookup, so the number of hops is the number of decoding steps, not a depth the
+  network has to have.
+- **CoT is the cheaper repair**: unlooped CoT learns in 1000-1500 steps and 6-8 minutes,
+  direct answers at r = 3 in 3500-9000 steps and 45-65 minutes (24000-step runs), and
+  still reach only 93-98% on 4 hops in the scan. The price is answer length: a k-hop
+  CoT answer decodes k - 1 intermediate keys before the value (the loop's price is r
+  forward passes per token instead).
+- Caveats: 2 seeds, one model size; the task is easy for CoT (every step is a copy of
+  the record that follows the last written key).
 
 ## Speed (2026-11-13)
 
