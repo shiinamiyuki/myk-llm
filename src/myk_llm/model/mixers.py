@@ -1,4 +1,5 @@
-"""Token mixers: softmax attention (global / sliding-window) and Gated DeltaNet.
+"""Token mixers: softmax attention (global / sliding-window), Gated DeltaNet, and the
+cross-decoder attention of a decoder-decoder (YOCO) model.
 
 Every mixer has the same call signature so the transformer block does not care which
 one it holds:
@@ -7,7 +8,8 @@ one it holds:
 
 `varlen` carries packed-document boundaries for document-masked training (tokens never
 mix across documents); `state` is the mixer's own inference cache (KV cache for
-attention, recurrent + convolution state for DeltaNet).
+attention, recurrent + convolution state for DeltaNet). A cross-decoder mixer has no
+cache of its own: its `state` is the shared KV of the whole pass (cached + new positions).
 """
 
 from __future__ import annotations
@@ -18,9 +20,9 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from flash_attn import flash_attn_func, flash_attn_varlen_func
 
-from .config import DELTANET, GLOBAL_ATTENTION, LOCAL_ATTENTION, ModelConfig
+from ..ops.flash_attn import flash_attn_func, flash_attn_varlen_func
+from .config import CROSS_ATTENTION, DELTANET, GLOBAL_ATTENTION, LOCAL_ATTENTION, ModelConfig
 from .layers import RMSNorm, RotaryEmbedding
 
 
@@ -39,7 +41,7 @@ class KVCache:
 
 
 class Attention(nn.Module):
-    """Grouped-query softmax attention via FlashAttention, global or sliding-window."""
+    """Grouped-query softmax attention via our Triton FlashAttention, global or sliding-window."""
 
     def __init__(self, config: ModelConfig, local: bool, use_rope: bool) -> None:
         super().__init__()
@@ -57,6 +59,9 @@ class Attention(nn.Module):
         self.gate_proj = nn.Linear(config.hidden_size, q_size, bias=False) if attn.output_gate else None
         theta = attn.rope_theta_local if local else attn.rope_theta_global
         self.rope = RotaryEmbedding(attn.head_dim, config.max_seq_len, theta) if use_rope else None
+        # Source of a cross-decoder's shared KV (cross.kv=layer): then the full keys /
+        # values are returned as the state on every call, not only when caching.
+        self.shares_kv = False
 
     def residual_projections(self) -> list[nn.Linear]:
         return [self.o_proj]
@@ -81,7 +86,7 @@ class Attention(nn.Module):
             q, k = self.rope(q, k, position_ids)
         window = (self.window - 1, 0) if self.window is not None else (-1, -1)
 
-        new_state = None
+        new_state = KVCache(k, v) if self.shares_kv else None
         if varlen is not None:
             out = flash_attn_varlen_func(
                 q.reshape(-1, self.num_heads, self.head_dim),
@@ -100,7 +105,7 @@ class Attention(nn.Module):
                 v = torch.cat([state.values, v], dim=1)
             # Attend over the full k/v; only the cache kept for the next step is trimmed
             # (early queries of a long prefill still need their own older keys).
-            if use_cache:
+            if use_cache or self.shares_kv:
                 limit = self.window if self.window is not None else self.max_seq_len
                 new_state = KVCache(k[:, -limit:], v[:, -limit:])
             out = flash_attn_func(q, k, v, causal=True, window_size=window)
@@ -108,6 +113,88 @@ class Attention(nn.Module):
         if self.gate_proj is not None:
             out = out * torch.sigmoid(self.gate_proj(x))
         return self.o_proj(out), new_state
+
+
+class SharedKV(nn.Module):
+    """The cross-decoder's keys / values, computed once from the self-decoder output
+    (cross.kv=project): K, V = Linear(norm(x)), appended to the cached ones."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        attn = config.attention
+        self.num_kv_heads, self.head_dim = attn.num_kv_heads, attn.head_dim
+        self.norm = RMSNorm(config.hidden_size, config.norm_eps)
+        self.kv_proj = nn.Linear(config.hidden_size, 2 * attn.num_kv_heads * attn.head_dim, bias=False)
+        self.k_norm = RMSNorm(attn.head_dim, config.norm_eps) if attn.qk_norm else None
+        self.rope = RotaryEmbedding(attn.head_dim, config.max_seq_len, attn.rope_theta_global) if config.cross_rope else None
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor, state: KVCache | None = None) -> KVCache:
+        batch, seq_len, _ = x.shape
+        k, v = self.kv_proj(self.norm(x)).view(batch, seq_len, 2 * self.num_kv_heads, self.head_dim).chunk(2, dim=2)
+        if self.k_norm is not None:
+            k = self.k_norm(k).to(v.dtype)
+        if self.rope is not None:
+            k = self.rope.rotate(k, position_ids)
+        if state is not None:
+            k = torch.cat([state.keys, k], dim=1)
+            v = torch.cat([state.values, v], dim=1)
+        return KVCache(k, v)
+
+
+class CrossAttention(nn.Module):
+    """Cross-decoder attention (YOCO): grouped-query causal attention from this layer's
+    own queries to the shared KV, which is passed in as `state`. Queries are aligned to the
+    end of the keys, so a pass over only the last positions (decoding, or a prefill that
+    keeps only the last outputs) attends exactly like a full pass."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        attn = config.attention
+        self.num_heads, self.num_kv_heads, self.head_dim = attn.num_heads, attn.num_kv_heads, attn.head_dim
+        q_size = attn.num_heads * attn.head_dim
+        self.q_proj = nn.Linear(config.hidden_size, q_size, bias=False)
+        self.o_proj = nn.Linear(q_size, config.hidden_size, bias=False)
+        self.q_norm = RMSNorm(attn.head_dim, config.norm_eps) if attn.qk_norm else None
+        self.gate_proj = nn.Linear(config.hidden_size, q_size, bias=False) if attn.output_gate else None
+        self.rope = RotaryEmbedding(attn.head_dim, config.max_seq_len, attn.rope_theta_global) if config.cross_rope else None
+
+    def residual_projections(self) -> list[nn.Linear]:
+        return [self.o_proj]
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        varlen: Varlen | None = None,
+        state: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, None]:
+        if state is None:
+            raise ValueError("a cross-decoder block needs the shared KV as its state")
+        batch, seq_len, _ = x.shape
+        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim)
+        if self.q_norm is not None:
+            q = self.q_norm(q).to(q.dtype)  # the fp32 norm weight would promote q to fp32
+        if self.rope is not None:
+            q = self.rope.rotate(q, position_ids)
+        out = self.attend(q, state, varlen).reshape(batch, seq_len, -1)
+        if self.gate_proj is not None:
+            out = out * torch.sigmoid(self.gate_proj(x))
+        return self.o_proj(out), None
+
+    def attend(self, q: torch.Tensor, kv: KVCache, varlen: Varlen | None) -> torch.Tensor:
+        if varlen is None:
+            return flash_attn_func(q, kv.keys, kv.values, causal=True)
+        return flash_attn_varlen_func(
+            q.reshape(-1, self.num_heads, self.head_dim),
+            kv.keys.reshape(-1, self.num_kv_heads, self.head_dim),
+            kv.values.reshape(-1, self.num_kv_heads, self.head_dim),
+            cu_seqlens_q=varlen.cu_seqlens,
+            cu_seqlens_k=varlen.cu_seqlens,
+            max_seqlen_q=varlen.max_seqlen,
+            max_seqlen_k=varlen.max_seqlen,
+            causal=True,
+        )
 
 
 class _FlaLayerState:
@@ -188,4 +275,6 @@ def build_mixer(config: ModelConfig, layer_type: str, first_global: bool) -> nn.
         return Attention(config, local=False, use_rope=rope == "all" or (rope == "first" and first_global))
     if layer_type == DELTANET:
         return DeltaNet(config)
+    if layer_type == CROSS_ATTENTION:
+        return CrossAttention(config)
     raise ValueError(f"unknown layer type {layer_type!r}")

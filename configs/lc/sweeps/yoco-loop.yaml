@@ -1,0 +1,31 @@
+# Looped cross-decoder (notes/yoco.md E6): one weight-shared "X" block iterated r times
+# over the shared KV of a sliding-window self-decoder, LLLL(X)xr. E4 found one hop per
+# cross block; does a looped one turn that into a test-time knob, and does it extrapolate
+# past the trained hops further than the looped DG core of loop-hops (whose context is
+# re-processed every iteration; here only the query state iterates over a fixed memory)?
+#   r2to10     random r in 2-10 per step (loop-hops' best recipe), evaluated at r = 10;
+#              compare loop-hops r2to10 (DG core) and yoco-chain LLLLXXXX (4 distinct blocks)
+#   r4         fixed r = 4: LLLLXXXX's compute with one block's parameters
+#   h6r2to10   r2to10 trained on 1-6 hops (the DG loop did not learn them from scratch;
+#              yoco-split's LLXXXXXX did)
+#   h6r6       fixed r = 6 on 1-6 hops (added after h6r2to10 failed and r4 learned faster
+#              than r2to10: does a fixed r make long chains learnable from scratch?)
+# Same task settings as yoco-chain / loop-hops; arms in priority order.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/yoco-loop.yaml --report --at 2048
+name: yoco-loop
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [steps=24000, task.cot=false, model.attention.global_rope=none,
+            model.layer_pattern=LLLLX, model.num_layers=5, model.loop.prelude=4, model.loop.core=1,
+            "task.eval_hops=[1, 2, 3, 4, 5, 6, 8, 10, 12]", "scan_lengths=[2048, 8192]",
+            "scan_iterations=[1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24]"]
+axes:
+  arch:
+    r2to10: [model.loop.iterations=6, "model.loop.train_iterations=[2, 10]", eval_iterations=10]
+    r4: [model.loop.iterations=4]
+    h6r2to10: ["task.hops=[1, 2, 3, 4, 5, 6]", task.min_len=320, model.loop.iterations=6,
+               "model.loop.train_iterations=[2, 10]", eval_iterations=10]
+    h6r6: ["task.hops=[1, 2, 3, 4, 5, 6]", task.min_len=320, model.loop.iterations=6]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]

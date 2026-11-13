@@ -1,0 +1,29 @@
+# Parallel blocks (model.parallel_block; GPT-J / PaLM: x + mixer(norm(x)) + ffn(norm(x)))
+# on the small-scale LM testbed (hidden 512, 8 layers, ~400M FineWeb-Edu en + zh tokens,
+# 64K vocabulary; notes/parallel.md). Two questions:
+#   1. how much bits per byte (bpb) does a parallel block lose against the sequential one?
+#   2. does looping the whole stack 2 or 3 times (model.loop, add injection, same
+#      parameters, r x the block compute) win that back?
+# Sequential arms are looped too, to tell "the loop repairs the parallel block" from
+# "the loop helps any block". Patterns tile over the 8 layers (LLLGLLLG, DDDGDDDG);
+# DeltaNet uses 4 heads of 128 (= hidden). Looped arms run micro-batches of 16 to fit
+# in memory; the global batch, hence the training, is unchanged. The validation set is
+# eval.batches x micro_batch_size rows, so they take 16 batches to score the same 256
+# windows per language as the unlooped arms (8 x 32). Runs are ordered by loop count so
+# the unlooped comparison finishes first.
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/parallel.yaml --report
+name: parallel-lm
+overrides: [logging.tensorboard=false, model.deltanet.num_heads=4, model.deltanet.head_dim=128]
+configs:
+  v64k: configs/ngram-small/v64k.yaml
+axes:
+  loop:
+    r1: []
+    r2: [model.loop.core=8, model.loop.iterations=2, data.micro_batch_size=16, eval.batches=16]
+    r3: [model.loop.core=8, model.loop.iterations=3, data.micro_batch_size=16, eval.batches=16]
+  pattern:
+    LLLG: [model.layer_pattern=LLLG]
+    DDDG: [model.layer_pattern=DDDG]
+  block:
+    seq: []
+    par: [model.parallel_block=true]

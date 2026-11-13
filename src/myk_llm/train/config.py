@@ -102,7 +102,9 @@ class ValSetConfig:
 @dataclass
 class EvalConfig:
     interval: int = 0  # steps between validation passes; 0 disables
-    batches: int = 8  # global batches per validation set
+    # Batches of data.micro_batch_size rows per validation set: the set grows or shrinks
+    # with the micro-batch size, so keep batches x micro_batch_size fixed across runs.
+    batches: int = 8
     seed: int = 999_983
     val_sets: list[ValSetConfig] = field(default_factory=list)
     sample_interval: int = 0  # steps between text samples; 0 disables

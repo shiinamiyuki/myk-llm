@@ -35,6 +35,10 @@ class LcConfig:
     seed: int = 0
     task: TaskConfig = field(default_factory=TaskConfig)
     model: ModelConfig = field(default_factory=ModelConfig)  # see configs/lc/base.yaml
+    # model.pt of an earlier run to continue from (e.g. a curriculum stage); the model
+    # config must match, the optimizer and schedule start fresh. With steps=0 the run
+    # only evaluates the checkpoint (e.g. a new scan).
+    init_from: str = ""
     steps: int = 5000
     batch_rows: int = 32  # rows of task.max_len tokens per step
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -46,6 +50,16 @@ class LcConfig:
     eval_interval: int = 1000
     eval_queries: int = 200  # per length, during training
     final_eval_queries: int = 1000  # per length, at the end
+    # Core iteration count of the evaluations during training and of the final one
+    # (looped models only; 0: model.loop.iterations). A model trained on a range of
+    # counts may need the top of the range for its hardest chains.
+    eval_iterations: int = 0
+    # Final scan, run when task.eval_hops or scan_iterations is set: the final checkpoint
+    # on hop counts task.eval_hops (empty: task.hops) at `scan_lengths` (empty:
+    # task.eval_lengths), once per core iteration count in `scan_iterations` (looped
+    # models: test-time depth; must be empty otherwise) or once at the model's own depth.
+    scan_iterations: list[int] = field(default_factory=list)
+    scan_lengths: list[int] = field(default_factory=list)
 
 
 def late_mean(late: list[tuple[int, dict[int, float]]], learned_step: int | None, lengths: list[int]) -> dict:
@@ -64,11 +78,15 @@ def train(config: LcConfig) -> dict:
         raise ValueError(f"model.vocab_size must be >= {VOCAB_SIZE}")
     if max(task.eval_lengths + [task.max_len]) > config.model.max_seq_len:
         raise ValueError("model.max_seq_len must cover the longest evaluation length (RoPE tables)")
+    if (config.eval_iterations or config.scan_iterations) and not config.model.loop.core:
+        raise ValueError("eval_iterations / scan_iterations need a looped model (model.loop.core > 0)")
     run_dir = Path(config.output_dir) / config.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "config.yaml").write_text(dump_yaml(config), encoding="utf-8")
 
     model = MykLLM(config.model).to(device)
+    if config.init_from:
+        model.load_state_dict(torch.load(config.init_from, map_location=device)["state_dict"])
     optimizers = build_optimizers(model, config.optimizer)
     base_lrs = [[g["lr"] for g in opt.param_groups] for opt in optimizers]
     if config.compile:
@@ -77,6 +95,7 @@ def train(config: LcConfig) -> dict:
     loader = iter(build_loader(task, config.batch_rows, config.seed, config.num_workers))
     metrics = MetricsLogger(run_dir / "metrics.jsonl")
     lengths = task.eval_lengths
+    eval_iterations = config.eval_iterations or None
     late: list[tuple[int, dict[int, float]]] = []  # (step, accuracy) of second-half evaluations
     # Retrieval appears abruptly after a plateau whose length varies with seed and
     # architecture; record when it happened so a late transition is not read as inability.
@@ -86,7 +105,7 @@ def train(config: LcConfig) -> dict:
         values = [a for length, a in accuracy.items() if length <= task.max_len]
         return float(np.mean(values)) if values else float("nan")
     params = model.num_parameters(exclude_embeddings=True)
-    print(f"[{config.run_name}] {params / 1e6:.2f}M non-embedding params, layers {''.join(config.model.layer_types)}, "
+    print(f"[{config.run_name}] {params / 1e6:.2f}M non-embedding params, layers {config.model.layout}, "
           f"{config.batch_rows}x{task.max_len} tokens/step, {config.steps} steps", flush=True)
 
     def log_eval(step: int, result: dict, prefix: str) -> None:
@@ -118,7 +137,7 @@ def train(config: LcConfig) -> dict:
             loss_sum = token_sum = 0.0
             window_start = time.perf_counter()
         if config.eval_interval and step % config.eval_interval == 0 and step != config.steps:
-            result = evaluate(model, task, lengths, config.eval_queries, seed=step)
+            result = evaluate(model, task, lengths, config.eval_queries, seed=step, iterations=eval_iterations)
             log_eval(step, result, "")
             if learned_step is None and in_distribution(result["accuracy"]) >= 0.9:
                 learned_step = step
@@ -128,8 +147,16 @@ def train(config: LcConfig) -> dict:
 
     # Save before the (slower) final evaluation so an interrupted eval can be redone.
     torch.save({"config": dump_yaml(config), "state_dict": model.state_dict()}, run_dir / "model.pt")
-    final = evaluate(model, task, lengths, config.final_eval_queries, seed=12345)
+    final = evaluate(model, task, lengths, config.final_eval_queries, seed=12345, iterations=eval_iterations)
     log_eval(config.steps, final, "final_")
+    scans = []
+    if task.eval_hops or config.scan_iterations:
+        for iterations in config.scan_iterations or [None]:
+            scan = evaluate(model, task, config.scan_lengths or lengths, config.final_eval_queries, seed=12345,
+                            iterations=iterations, hops=task.eval_hops or None)
+            scans.append({"iterations": iterations, "accuracy": scan["accuracy"], "hops": scan["hops"]})
+            print(f"[{config.run_name}] scan, iterations {iterations or 'default'}: "
+                  + " ".join(f"{length}:{a:.2f}" for length, a in scan["accuracy"].items()), flush=True)
     metrics.close()
     if learned_step is None and in_distribution(final["accuracy"]) >= 0.9:
         learned_step = config.steps
@@ -142,6 +169,7 @@ def train(config: LcConfig) -> dict:
         "accuracy_late": late_mean(late, learned_step, lengths),
         "in_distribution": in_distribution(final["accuracy"]),
         "learned_step": learned_step,  # first evaluation at >= 90% in distribution (None: never)
+        "scan": scans,  # [{"iterations": count or None (default), "accuracy": ..., "hops": ...}]
         "non_embedding_params": params,
         "train_minutes": (time.perf_counter() - started) / 60,
     }

@@ -121,3 +121,61 @@ def test_scoring_marks_exactly_the_queries_with_a_wrong_answer_token():
     start, end = examples[1].answers[2]
     wrong = {(1, end - 2), (0, 5)}  # last answer token of row 1's third query; a context position
     assert score_batch(Oracle(wrong), examples) == [True] * 5 + [False]
+
+
+def test_evaluation_can_draw_other_hop_counts():
+    from myk_llm.lc.eval import evaluate
+
+    task = TaskConfig(num_records=8, num_queries=4, hops=[1, 2])
+    result = evaluate(Oracle(set()), task, [512], queries=40, seed=0, hops=[5, 6])
+    assert set(result["hops"][512]) == {5, 6} and result["accuracy"][512] == 1.0
+
+
+def test_report_tabulates_final_scans(tmp_path):
+    import json
+
+    from myk_llm.lc.sweep import report
+
+    for seed, six_hops in ((0, 0.5), (1, 0.7)):
+        run = f"chain-loop-s{seed}"
+        result = {
+            "run_name": run, "train_len": 2048, "train_minutes": 1.0,
+            "accuracy": {"2048": 1.0}, "depth": {"2048": [1.0]}, "hops": {"2048": {"1": 1.0}},
+            "scan": [{"iterations": 8, "accuracy": {"2048": 0.8}, "hops": {"2048": {"1": 1.0, "6": six_hops}}}],
+        }
+        (tmp_path / run).mkdir()
+        (tmp_path / run / "results.json").write_text(json.dumps(result))
+    assert "| chain-loop | 8 | 2 | 100 | 60 |" in report(tmp_path, at=2048)
+
+
+def test_exit_rules_stop_at_the_first_passing_iteration_within_the_budget():
+    from myk_llm.lc.halting import exit_iterations
+
+    inf = float("inf")
+    delta = np.array([[inf, 0.5, 0.05, 0.01], [inf, 0.01, 0.5, 0.5], [inf, 0.5, 0.5, 0.5]])
+    assert exit_iterations(delta, "<", 0.1, budget=4).tolist() == [3, 2, 4]
+    assert exit_iterations(delta, "<", 0.02, budget=3).tolist() == [3, 2, 3]  # iteration 4 is past the budget
+    assert exit_iterations(1 - delta, ">", 0.9, budget=4).tolist() == [3, 2, 4]
+
+
+def test_trace_reads_the_model_out_after_every_iteration():
+    from conftest import requires_cuda, tiny_model_config
+    from myk_llm.lc.halting import trace
+    from myk_llm.model import MykLLM
+
+    if not torch.cuda.is_available():
+        pytest.skip(requires_cuda.kwargs["reason"])
+    torch.manual_seed(0)
+    model = MykLLM(tiny_model_config(num_layers=2, layer_pattern="G", **{"loop.core": 2, "loop.iterations": 3})).cuda().eval()
+    task = TaskConfig(num_records=4, num_queries=2, hops=[1, 2])
+    examples = [make_example(np.random.default_rng(i), task, 256) for i in range(3)]
+    traced = trace(model, examples, iterations=4)
+    assert traced["conf"].shape == (6, 4) and np.isinf(traced["delta"][:, 0]).all()
+    # Iteration t of a 4-iteration pass reads out exactly what a t-iteration pass returns.
+    ids = torch.from_numpy(np.stack([e.ids for e in examples])).cuda()
+    for t in (1, 2, 4):
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            hidden = model(ids, seqlens=[torch.tensor([256])] * 3, iterations=t).hidden
+        conf = [min(torch.softmax(model.logits(hidden[row, start - 1 : end - 1].float()).float(), -1).max(-1).values.tolist())
+                for row, e in enumerate(examples) for start, end in e.answers]
+        np.testing.assert_allclose(traced["conf"][:, t - 1], conf, rtol=1e-4)

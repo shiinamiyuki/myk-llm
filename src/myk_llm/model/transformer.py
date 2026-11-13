@@ -1,5 +1,10 @@
 """The MykLLM decoder: embeddings -> blocks -> final norm, plus optional MTP modules.
 
+With `loop.core` set, the blocks are prelude -> core (looped, shared weights) -> coda.
+With trailing "X" blocks (decoder-decoder, YOCO) they are self-decoder -> shared KV ->
+cross-decoder; the looped core then lies either in the self-decoder or in the
+cross-decoder (a looped cross-decoder re-queries the same shared KV every iteration).
+
 The model returns hidden states, not a loss. Objectives (cross entropy, z-loss,
 multi-token prediction, distillation) live in `myk_llm.train.objectives` and use
 `output_weight` directly, so the full (tokens, vocab) logits never need to exist.
@@ -7,6 +12,7 @@ multi-token prediction, distillation) live in `myk_llm.train.objectives` and use
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -18,11 +24,41 @@ from torch.utils.checkpoint import checkpoint
 from .config import GLOBAL_ATTENTION, ModelConfig
 from .embeddings import Embeddings
 from .layers import ResidualGate, RMSNorm, SwiGLU, init_linear_, residual_init_scale
-from .mixers import Varlen, build_mixer
+from .mixers import Attention, SharedKV, Varlen, build_mixer
+
+
+_side_streams: dict[int, torch.cuda.Stream] = {}
+
+
+@torch.compiler.disable
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    index = torch.cuda.current_device() if device.index is None else device.index
+    if index not in _side_streams:
+        _side_streams[index] = torch.cuda.Stream(index)
+    return _side_streams[index]
+
+
+def _concurrently(
+    first: Callable[[], Any], second: Callable[[], Any], side: torch.cuda.Stream
+) -> tuple[Any, Any]:
+    """first() on the current CUDA stream, second() on `side`, joined after (compiles
+    into one graph with both streams). Memory second() allocates is freed to the side
+    stream, whose next work waits for the current stream first."""
+    main = torch.cuda.current_stream()
+    side.wait_stream(main)
+    with torch.cuda.stream(side):
+        b = second()
+    a = first()
+    main.wait_stream(side)
+    return a, b
 
 
 class Block(nn.Module):
-    """Pre-norm block: x + g1 * mixer(norm(x)), then x + g2 * ffn(norm(x))."""
+    """Pre-norm block: x + g1 * mixer(norm(x)), then x + g2 * ffn(norm(x)); or, with
+    `parallel_block`, x + g1 * mixer(h) + g2 * ffn(h) with h = norm(x) (one norm).
+
+    At inference a parallel block can run the FFN on a second CUDA stream, concurrently
+    with the mixer (`parallel_streams`)."""
 
     def __init__(self, config: ModelConfig, layer_type: str, first_global: bool) -> None:
         super().__init__()
@@ -30,9 +66,10 @@ class Block(nn.Module):
         self.mixer_norm = RMSNorm(config.hidden_size, config.norm_eps)
         self.mixer = build_mixer(config, layer_type, first_global)
         self.mixer_gate = ResidualGate(config.residual, config.hidden_size)
-        self.ffn_norm = RMSNorm(config.hidden_size, config.norm_eps)
+        self.ffn_norm = None if config.parallel_block else RMSNorm(config.hidden_size, config.norm_eps)
         self.ffn = SwiGLU(config)
         self.ffn_gate = ResidualGate(config.residual, config.hidden_size)
+        self.streams = config.parallel_streams
         self.activation_checkpointing = False  # recompute this block in backward
 
     def residual_projections(self) -> list[nn.Linear]:
@@ -47,18 +84,45 @@ class Block(nn.Module):
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, Any]:
         if self.activation_checkpointing and torch.is_grad_enabled() and not use_cache:
-            return checkpoint(self._forward, x, position_ids, varlen, None, False, use_reentrant=False)
+            # `state` is None here except for a cross-decoder block (the shared KV).
+            return checkpoint(self._forward, x, position_ids, varlen, state, False, use_reentrant=False)
         return self._forward(x, position_ids, varlen, state, use_cache)
 
     def _forward(
         self, x: torch.Tensor, position_ids: torch.Tensor, varlen: Varlen | None, state: Any, use_cache: bool
     ) -> tuple[torch.Tensor, Any]:
         h = self.mixer_norm(x)
+        if self.ffn_norm is None:  # parallel: the FFN reads the mixer's input, not its output
+            (update, state), ffn_out = self._parallel(h, position_ids, varlen, state, use_cache)
+            return self.ffn_gate(self.mixer_gate(x, update, h), ffn_out, h), state
         update, state = self.mixer(h, position_ids, varlen, state, use_cache)
         x = self.mixer_gate(x, update, h)
         h = self.ffn_norm(x)
         x = self.ffn_gate(x, self.ffn(h), h)
         return x, state
+
+    def side_stream(self, device: torch.device) -> torch.cuda.Stream:
+        # Fetched once per block outside compiled code (a graph break here would split the
+        # stream fork / join across graphs).
+        stream = self.__dict__.get("_side_stream")
+        if stream is None:
+            stream = self.__dict__["_side_stream"] = _side_stream(device)
+        return stream
+
+    def _parallel(
+        self, h: torch.Tensor, position_ids: torch.Tensor, varlen: Varlen | None, state: Any, use_cache: bool
+    ) -> tuple[tuple[torch.Tensor, Any], torch.Tensor]:
+        """(mixer(h), ffn(h)) of a parallel block."""
+
+        def mixer() -> tuple[torch.Tensor, Any]:
+            return self.mixer(h, position_ids, varlen, state, use_cache)
+
+        def ffn() -> torch.Tensor:
+            return self.ffn(h)
+
+        if self.streams and h.is_cuda and not torch.is_grad_enabled():
+            return _concurrently(mixer, ffn, self.side_stream(h.device))
+        return mixer(), ffn()
 
 
 class MTPModule(nn.Module):
@@ -79,6 +143,23 @@ class MTPModule(nn.Module):
         x = self.proj(torch.cat([self.hidden_norm(hidden), self.embed_norm(next_embed)], dim=-1))
         x, _ = self.block(x, position_ids, varlen)
         return x
+
+
+class Injection(nn.Module):
+    """Starts each loop iteration by combining the loop state with the core's input."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.kind = config.loop.injection
+        if self.kind == "concat":
+            self.state_norm = RMSNorm(config.hidden_size, config.norm_eps)
+            self.input_norm = RMSNorm(config.hidden_size, config.norm_eps)
+            self.proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+
+    def forward(self, state: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+        if self.kind == "add":
+            return state + inputs
+        return self.proj(torch.cat([self.state_norm(state), self.input_norm(inputs)], dim=-1))
 
 
 @dataclass
@@ -114,6 +195,17 @@ class MykLLM(nn.Module):
         if config.tie_embeddings:
             self.lm_head.weight = self.embed.token.weight
         self.mtp = nn.ModuleList(MTPModule(config) for _ in range(config.mtp.depth))
+        self.injection = Injection(config) if config.loop.core else None
+        self.cross_start, self.cross_kv_layer = config.cross_start, config.cross_kv_layer
+        has_cross = self.cross_start < len(self.layers)
+        self.shared_kv = SharedKV(config) if has_cross and config.cross.kv == "project" else None
+        if self.cross_kv_layer is not None:
+            source = self.layers[self.cross_kv_layer].mixer
+            assert isinstance(source, Attention)
+            source.shares_kv = True
+        # Training draws iteration counts from its own generator, seeded like the model
+        # init, so that every FSDP rank runs the same blocks in the same order.
+        self._iteration_rng = random.Random(torch.initial_seed())
         self.init_weights()
 
     # -- initialization ---------------------------------------------------------------
@@ -121,7 +213,7 @@ class MykLLM(nn.Module):
     def init_weights(self) -> None:
         std = self.config.initializer_range
         self.apply(lambda module: init_linear_(module, std))
-        scale = residual_init_scale(self.config.num_layers)
+        scale = residual_init_scale(self.config.effective_layers)
         for block in self.blocks:
             for proj in block.residual_projections():
                 proj.weight.mul_(scale)
@@ -151,6 +243,9 @@ class MykLLM(nn.Module):
 
     def compile_blocks(self, **kwargs: Any) -> None:
         """torch.compile each block in place (parameter names are unchanged)."""
+        # All blocks share Block.forward, so every (layer type, grad mode, shape) variant
+        # is one more compiled entry of the same code; past the limit, blocks run eagerly.
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 16)
         for block in self.blocks:
             block.compile(**kwargs)
 
@@ -169,6 +264,8 @@ class MykLLM(nn.Module):
         prefix_ids: torch.Tensor | None = None,
         head: Callable[["MykLLM", ModelOutput], Any] | None = None,
         embed_offset: torch.Tensor | None = None,
+        iterations: int | None = None,
+        keep_last: int = 0,
     ) -> Any:
         """`seqlens` enables document masking (training); `cache`/`use_cache` drive
         incremental decoding; `prefix_ids` are the tokens preceding `input_ids`
@@ -176,6 +273,17 @@ class MykLLM(nn.Module):
 
         `embed_offset` (batch, seq_len, hidden) is added to the input embeddings (e.g. a
         task-specific positional signal computed outside the model).
+
+        `iterations` sets the core iteration count of a looped model (test-time depth;
+        default: see `num_iterations`). Every self-decoder block call keeps its own cache
+        entry, so a cache only fits passes with the iteration count it was built with;
+        cross-decoder blocks keep no state, so the cache of a looped cross-decoder fits
+        every iteration count.
+
+        `keep_last` > 0: only the outputs of the last `keep_last` positions are needed
+        (e.g. a prefill), so the cross-decoder of a decoder-decoder model and the final norm
+        run on those positions only; `hidden`, `residual` and `position_ids` of the output
+        then cover just them. The cache is complete either way.
 
         Returns a ModelOutput, or `head(self, output)` when `head` is given. Losses run
         as a head so that they execute inside forward: under FSDP (fully sharded data
@@ -186,22 +294,102 @@ class MykLLM(nn.Module):
             position_ids = torch.arange(seq_len, device=input_ids.device).expand(batch, -1)
         varlen = None
         if seqlens is not None:
-            if use_cache:
-                raise ValueError("document masking (seqlens) cannot be combined with a cache")
+            if use_cache or keep_last:
+                raise ValueError("document masking (seqlens) cannot be combined with a cache or keep_last")
             varlen = build_varlen(seqlens, batch, seq_len, input_ids.device)
         x, ngram_updates = self.embed(input_ids, prefix_ids)
         if embed_offset is not None:
             x = x + embed_offset
-        states = cache if cache is not None else [None] * len(self.layers)
+        loop, cross_start, num_layers = self.config.loop, self.cross_start, len(self.layers)
+        iterations = self.num_iterations(iterations)
+        cross_loop = bool(loop.core) and loop.prelude >= cross_start  # the core is cross-decoder blocks
+        self_core = 0 if cross_loop else loop.core
+        # One cache entry per self-decoder block call, plus the shared KV (decoder-decoder,
+        # project), plus one (empty) entry per cross-decoder block, however often it runs.
+        num_calls = num_layers + self_core * (iterations - 1) + (self.shared_kv is not None)
+        if cache is not None and len(cache) != num_calls:
+            raise ValueError(f"cache has {len(cache)} entries but this pass runs {num_calls} blocks (iteration count changed?)")
+        states = iter(cache if cache is not None else [None] * num_calls)
         new_cache: list[Any] | None = [] if use_cache else None
-        for index, (block, state) in enumerate(zip(self.layers, states)):
-            if index in ngram_updates:
-                x = x + ngram_updates[index]
-            x, state = block(x, position_ids, varlen, state, use_cache)
+
+        shared: Any = None  # the cross-decoder's keys / values
+
+        def run(index: int, x: torch.Tensor) -> torch.Tensor:
+            nonlocal shared
+            x, state = self.layers[index](x, position_ids, varlen, next(states), use_cache)
             if new_cache is not None:
                 new_cache.append(state)
+            if index == self.cross_kv_layer:
+                shared = state
+            return x
+
+        def cross(index: int, x: torch.Tensor) -> torch.Tensor:
+            return self.layers[index](x, position_ids, varlen, shared)[0]
+
+        def enter(index: int, x: torch.Tensor) -> torch.Tensor:
+            return x + ngram_updates[index][:, -x.size(1) :] if index in ngram_updates else x
+
+        def stack(start: int, end: int, block: Callable[[int, torch.Tensor], torch.Tensor], looped: bool, x: torch.Tensor) -> torch.Tensor:
+            """Blocks [start, end) in order, with the loop core among them if `looped`."""
+            core_start = loop.prelude if looped else end
+            for index in range(start, core_start):
+                x = block(index, enter(index, x))
+            if looped:
+                x = self._run_core(enter(core_start, x), block, iterations)
+            for index in range(core_start + loop.core if looped else end, end):
+                x = block(index, enter(index, x))
+            return x
+
+        x = stack(0, cross_start, run, bool(self_core), x)
+        self_output, self_positions = x, position_ids
+        if keep_last:
+            x, position_ids = x[:, -keep_last:], position_ids[:, -keep_last:]
+        if cross_start < num_layers:
+            if self.shared_kv is not None:
+                # From the self-decoder output at every position, not only the kept ones.
+                shared = self.shared_kv(self_output, self_positions, next(states))
+                if new_cache is not None:
+                    new_cache.append(shared)
+            for _ in range(cross_start, num_layers):  # cross-decoder blocks keep no state
+                next(states)
+                if new_cache is not None:
+                    new_cache.append(None)
+            x = stack(cross_start, num_layers, cross, cross_loop, x)
         output = ModelOutput(self.final_norm(x), x, position_ids, varlen, new_cache)
         return head(self, output) if head is not None else output
+
+    def num_iterations(self, iterations: int | None = None) -> int:
+        """Core iterations of one pass: `iterations` if given, else a draw from
+        loop.train_iterations in training mode, else loop.iterations."""
+        loop = self.config.loop
+        if not loop.core:
+            if iterations is not None:
+                raise ValueError("iterations needs a looped model (model.loop.core > 0)")
+            return 1
+        if iterations is not None:
+            if iterations < 1:
+                raise ValueError(f"iterations must be >= 1, got {iterations}")
+            return iterations
+        if self.training and loop.train_iterations:
+            return self._iteration_rng.randint(*loop.train_iterations)
+        return loop.iterations
+
+    def _run_core(self, inputs: torch.Tensor, block: Callable[[int, torch.Tensor], torch.Tensor], iterations: int) -> torch.Tensor:
+        """The core blocks (`block(index, x)` runs one), `iterations` times over a loop
+        state that starts at zero and takes in `inputs` at the start of every iteration.
+        With truncated backpropagation the earlier iterations run without autograd
+        (gradients still reach `inputs` through the later ones)."""
+        loop, injection = self.config.loop, self.injection
+        assert injection is not None
+        grad = torch.is_grad_enabled()
+        first_tracked = iterations - loop.backprop_iterations if grad and loop.backprop_iterations else 0
+        state = torch.zeros_like(inputs)
+        for iteration in range(iterations):
+            with torch.set_grad_enabled(grad and iteration >= first_tracked):
+                state = injection(state, inputs)
+                for index in range(loop.prelude, loop.prelude + loop.core):
+                    state = block(index, state)
+        return state
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)

@@ -64,6 +64,9 @@ class TaskConfig:
     key_len: int = 2
     value_len: int = 4
     hops: list[int] = field(default_factory=lambda: [1])  # each item's hop count is drawn from these
+    # Hop counts of lc.train's final scan (empty: `hops`); counts above max(hops) measure
+    # hop extrapolation, e.g. of looped models given more iterations.
+    eval_hops: list[int] = field(default_factory=list)
     cot: bool = False  # answers spell out the intermediate keys of a chain
     eval_lengths: list[int] = field(default_factory=lambda: [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536])
     depth_buckets: int = 10
@@ -79,6 +82,8 @@ class TaskConfig:
             raise ValueError("need 1 <= copy_min <= copy_max <= max_len / 2")
         if not self.hops or min(self.hops) < 1:
             raise ValueError("hops must be a non-empty list of positive counts")
+        if self.eval_hops and min(self.eval_hops) < 1:
+            raise ValueError("eval_hops must be positive counts")
 
     def sample_length(self, rng: np.random.Generator) -> int:
         if self.length_dist == "uniform":

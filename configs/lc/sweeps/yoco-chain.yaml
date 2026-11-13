@@ -1,0 +1,25 @@
+# Decoder-decoder (YOCO, model.cross; notes/yoco.md) on multi-hop chains with direct
+# answers (E3; same protocol as loop-confirm, whose DG8 is the 4-global-layer reference).
+# A cross-decoder only updates the query positions: the records' representations come
+# from the self-decoder alone, so every hop has to be resolved at the query, one lookup
+# per cross block. 8 blocks each, NoPE global / cross attention, 24000 steps, 2 seeds.
+#   LLLLXXXX / DDDDXXXX  YOCO: one shared KV, 4 cross-attention blocks
+#   LLLLLLLG / DDDDDDDG  same KV cache size (one global layer); E3b: 1:7 fails 3-4 hops
+#   LLLLGGGG / DDDDGGGG  same layer types, 4 global layers with their own KV
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/yoco-chain.yaml --report --at 2048
+name: yoco-chain
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [steps=24000, task.cot=false, model.attention.global_rope=none,
+            "task.eval_hops=[1, 2, 3, 4, 5, 6, 8]", "scan_lengths=[2048, 8192]"]
+axes:
+  arch:
+    LLLLXXXX: [model.layer_pattern=LLLLXXXX]
+    DDDDXXXX: [model.layer_pattern=DDDDXXXX]
+    LLLLLLLG: [model.layer_pattern=LLLLLLLG]
+    DDDDDDDG: [model.layer_pattern=DDDDDDDG]
+    LLLLGGGG: [model.layer_pattern=LLLLGGGG]
+    DDDDGGGG: [model.layer_pattern=DDDDGGGG]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]

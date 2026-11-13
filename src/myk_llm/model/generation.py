@@ -41,7 +41,7 @@ def generate(
     tokens = input_ids
     batch = tokens.size(0)
     context = model.embed.context
-    output, logits = model(tokens, use_cache=True, head=_last_logits)
+    output, logits = model(tokens, use_cache=True, keep_last=1, head=_last_logits)
     cache = output.cache
     finished = torch.zeros(batch, dtype=torch.bool, device=tokens.device)
     prompt_len = tokens.size(1)

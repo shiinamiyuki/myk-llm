@@ -1,0 +1,24 @@
+# Decoder-decoder (YOCO, model.cross; notes/yoco.md) on the needle task (E2 / E4): does a
+# cross-decoder over one shared KV retrieve and extrapolate like the hybrids with their
+# own global layers? 8 blocks each, NoPE global / cross attention, 8000 steps, 2 seeds.
+#   LLLLXXXX / DDDDXXXX  YOCO: 4 local / DeltaNet blocks, KV projected from their output,
+#                        4 cross-attention blocks
+#   LLLGXXXX_layer       the cross-decoder reuses the keys / values of the G layer (3)
+#   LLLLGGGG / DDDDGGGG  same layer types, each global layer with its own KV (no sharing)
+# The 1:7 hybrids with the same KV cache size (one global layer: LLLLLLLG, DDDDDDDG) are
+# at 100% to 64K in e4b-followup.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/yoco-needle.yaml --report --at 16384
+name: yoco-needle
+configs:
+  needle: configs/lc/needle.yaml
+overrides: [model.attention.global_rope=none]
+axes:
+  arch:
+    LLLLXXXX: [model.layer_pattern=LLLLXXXX]
+    DDDDXXXX: [model.layer_pattern=DDDDXXXX]
+    LLLGXXXX_layer: [model.layer_pattern=LLLGXXXX, model.cross.kv=layer]
+    LLLLGGGG: [model.layer_pattern=LLLLGGGG]
+    DDDDGGGG: [model.layer_pattern=DDDDGGGG]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]

@@ -1,0 +1,16 @@
+# Second seed (s1) for the yoco.yaml arms within noise of each other or of the baseline
+# (LLLLXXXX was 0.005 bpb better than GL on seed 0, at the edge of the seed spread).
+# Same name, so the runs land in runs/sweeps/yoco-lm and its report averages the seeds.
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/yoco.yaml --report
+name: yoco-lm
+overrides: [logging.tensorboard=false]
+configs:
+  v64k: configs/ngram-small/v64k.yaml
+axes:
+  arch:
+    GL: []
+    GLGLXXXX_layer: [model.layer_pattern=GLGLXXXX, model.cross.kv=layer]
+    LLLLXXXX: [model.layer_pattern=LLLLXXXX]
+    LLLLGGGG: [model.layer_pattern=LLLLGGGG]
+  seed:
+    s1: [seed=1]

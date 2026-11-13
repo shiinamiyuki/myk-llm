@@ -1,0 +1,22 @@
+# Parallel blocks on multi-hop chains with chain-of-thought (CoT) answers (notes/parallel.md):
+# parallel-chain.yaml asked for direct answers, which need serial depth; with CoT every
+# written key is one single-hop lookup, and E3's sequential LLLG / DDDG learned all 1-4
+# hops at 1000-1500 steps (100% to 16K). Does the parallel block learn CoT chains as fast,
+# and do either extrapolate to 5-8 hops? E3's CoT setting (NoPE global layers, 8000
+# steps); unlooped, 2 seeds.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/parallel-chain-cot.yaml --report --at 2048
+name: parallel-chain-cot
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [task.cot=true, model.attention.global_rope=none,
+            "task.eval_hops=[1, 2, 3, 4, 5, 6, 7, 8]", "scan_lengths=[2048, 8192]"]
+axes:
+  pattern:
+    LLLG: [model.layer_pattern=LLLG]
+    DDDG: [model.layer_pattern=DDDG]
+  block:
+    seq: []
+    par: [model.parallel_block=true]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]

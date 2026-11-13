@@ -1,0 +1,30 @@
+# Hop extrapolation of the add-injected loop (notes/loop.md, after loop-confirm.yaml):
+# does a wider training range of iteration counts (2-10 instead of 2-6) make chains
+# longer than the trained 1-4 hops follow test-time iterations, does truncated
+# backpropagation through time (BPTT, gradients through the last 4 iterations only)
+# keep that at lower cost, and how far past the trained hops does a model trained on
+# 1-6 hops get? r2to6 is loop-confirm's add2to6 again (same seeds), scanned like the
+# rest. Every arm: loop.iterations (init depth) = the middle of its range, evaluated at
+# the top. The 1-6 hop arm needs min_len 320 (8 six-hop chains + queries = 288 tokens).
+# Arms in priority order (the sweep runs them arm by arm).
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/loop-hops.yaml --report --at 2048
+name: loop-hops
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [steps=24000, task.cot=false, model.layer_pattern=DG, model.attention.global_rope=none,
+            model.num_layers=2, model.loop.core=2,
+            "task.eval_hops=[1, 2, 3, 4, 5, 6, 8, 10, 12]", "scan_lengths=[2048, 8192]",
+            "scan_iterations=[1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24]"]
+axes:
+  arch:
+    r2to10: [model.loop.iterations=6, "model.loop.train_iterations=[2, 10]", eval_iterations=10]
+    h6r2to10: ["task.hops=[1, 2, 3, 4, 5, 6]", task.min_len=320, model.loop.iterations=6,
+               "model.loop.train_iterations=[2, 10]", eval_iterations=10]
+    r2to10bp4: [model.loop.iterations=6, "model.loop.train_iterations=[2, 10]", model.loop.backprop_iterations=4,
+                eval_iterations=10]
+    r2to6: [model.loop.iterations=4, "model.loop.train_iterations=[2, 6]", eval_iterations=6]
+  seed:
+    s0: [seed=0]
+    s1: [seed=1]
+    s2: [seed=2]
+    s3: [seed=3]

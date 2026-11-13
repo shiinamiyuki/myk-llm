@@ -1,0 +1,19 @@
+# Two more seeds (s2, s3) for the four 1-4 hop chain arms of yoco-chain.yaml whose two
+# seeds disagreed or need confirming (the unshared GGGG controls split 83 / 30 at 4
+# hops). Same name, so the runs land in runs/lc/yoco-chain and its report averages all
+# four seeds; the 1-global-layer arms (at chance from 2 hops on both seeds) are left out.
+#   python -m myk_llm.lc.sweep configs/lc/sweeps/yoco-chain.yaml --report --at 2048
+name: yoco-chain
+configs:
+  chain: configs/lc/chain.yaml
+overrides: [steps=24000, task.cot=false, model.attention.global_rope=none,
+            "task.eval_hops=[1, 2, 3, 4, 5, 6, 8]", "scan_lengths=[2048, 8192]"]
+axes:
+  arch:
+    LLLLXXXX: [model.layer_pattern=LLLLXXXX]
+    DDDDXXXX: [model.layer_pattern=DDDDXXXX]
+    LLLLGGGG: [model.layer_pattern=LLLLGGGG]
+    DDDDGGGG: [model.layer_pattern=DDDDGGGG]
+  seed:
+    s2: [seed=2]
+    s3: [seed=3]

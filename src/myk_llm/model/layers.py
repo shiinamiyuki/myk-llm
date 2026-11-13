@@ -93,13 +93,15 @@ class RotaryEmbedding(nn.Module):
         self.sin_cached = cast(torch.Tensor, self.sin_cached).float()
         return self
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def rotate(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        """Rotate (batch, seq, heads, head_dim) queries or keys to their positions."""
         cos = cast(torch.Tensor, self.cos_cached)[position_ids].unsqueeze(2)
         sin = cast(torch.Tensor, self.sin_cached)[position_ids].unsqueeze(2)
-        q32, k32 = q.float(), k.float()
-        q_out = q32 * cos + rotate_half(q32) * sin
-        k_out = k32 * cos + rotate_half(k32) * sin
-        return q_out.to(q.dtype), k_out.to(k.dtype)
+        x32 = x.float()
+        return (x32 * cos + rotate_half(x32) * sin).to(x.dtype)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.rotate(q, position_ids), self.rotate(k, position_ids)
 
 
 def init_linear_(module: nn.Module, std: float) -> None:
