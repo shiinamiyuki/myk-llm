@@ -1,0 +1,5 @@
+# ~617M parameters (~550M non-embedding): 32 layers (8x DDDG), one global attention
+# layer every 4 layers, ending on a global layer.
+base: 200m-dddg.yaml
+model:
+  num_layers: 32

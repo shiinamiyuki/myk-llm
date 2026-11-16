@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Literal
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from .config import OptimizerConfig, ScheduleConfig
 
@@ -16,7 +18,8 @@ NS_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
 
 
 def newton_schulz_orthogonalize(grad: torch.Tensor, steps: int, eps: float = 1e-7) -> torch.Tensor:
-    """Approximate U V^T of grad = U S V^T with a quintic Newton-Schulz iteration (bf16)."""
+    """Approximate U V^T of grad = U S V^T with a quintic Newton-Schulz iteration in
+    Brain Floating Point 16-bit (BF16)."""
     a, b, c = NS_COEFFICIENTS
     x = grad.bfloat16()
     transposed = grad.size(0) > grad.size(1)
@@ -29,13 +32,49 @@ def newton_schulz_orthogonalize(grad: torch.Tensor, steps: int, eps: float = 1e-
     return x.T if transposed else x
 
 
+def _can_fast_cuda_muon(p: torch.Tensor, g: torch.Tensor, m: torch.Tensor) -> bool:
+    supported = (torch.float32, torch.bfloat16)
+    return (
+        not isinstance(p, DTensor)
+        and not isinstance(g, DTensor)
+        and p.is_cuda
+        and p.ndim == 2
+        and p.is_contiguous()
+        and g.is_contiguous()
+        and m.is_contiguous()
+        and p.dtype in supported
+        and g.dtype in supported
+        and m.dtype in supported
+    )
+
+
+def _can_owner_sharded_fsdp_muon(p: torch.Tensor, g: torch.Tensor) -> bool:
+    if not (isinstance(p, DTensor) and isinstance(g, DTensor) and p.is_cuda and p.ndim == 2):
+        return False
+    mesh = p.device_mesh
+    if mesh.ndim != 1 or len(p.placements) != 1 or p.placements != g.placements:
+        return False
+    placement = p.placements[0]
+    if not (isinstance(placement, Shard) and placement.dim == 0):
+        return False
+    world = mesh.size()
+    if p.shape[0] % world != 0:
+        return False
+    if world > 1 and (not dist.is_initialized() or dist.get_backend(mesh.get_group()) != "nccl"):
+        return False
+    return p.to_local().is_contiguous() and g.to_local().is_contiguous()
+
+
 class Muon(torch.optim.Optimizer):
     """Muon (momentum + orthogonalized updates) for 2-D weight matrices.
 
-    Numerically matches `torch.optim.Muon`, but also accepts FSDP-sharded parameters
-    (DTensor): momentum is kept on the local shard, and the orthogonalization, which
-    needs the whole matrix, runs on an all-gathered copy. Every rank orthogonalizes
-    every matrix (redundant but simple; fine up to ~1B parameters).
+    Numerically matches `torch.optim.Muon`. On Compute Unified Device Architecture (CUDA)
+    tensors, parameters are grouped by shape and updated with fused Triton pack / unpack
+    kernels and symmetric Gram products (`ops.muon`). Under Fully Sharded Data Parallel
+    (FSDP) (`DTensor`), momentum stays on each rank's local shard and full matrices are
+    distributed across ranks via BF16 all-to-all so each rank orthogonalizes `1 / world_size`
+    of the matrices (falling back to `full_tensor()` on Central Processing Unit (CPU) or
+    uneven shards).
     """
 
     def __init__(
@@ -60,9 +99,70 @@ class Muon(torch.optim.Optimizer):
             return 0.2 * math.sqrt(max(rows, cols))
         return 1.0
 
+    def _step_fsdp_bucket(
+        self,
+        items: list[tuple[DTensor, DTensor, DTensor]],
+        lr: float,
+        weight_decay: float,
+        momentum: float,
+        nesterov: bool,
+        ns_steps: int,
+        adjust_lr: str,
+    ) -> None:
+        from ..ops.muon import batched_newton_schulz_orthogonalize
+
+        sample_p = items[0][0]
+        shape = sample_p.shape
+        rows, cols = shape
+        mesh = sample_p.device_mesh
+        world = mesh.size()
+        shard_rows = rows // world
+        device = sample_p.to_local().device
+
+        local_params = [p.to_local() for p, _, _ in items]
+        local_grads = [g.to_local() for _, g, _ in items]
+        local_bufs = [b.to_local() for _, _, b in items]
+        torch._foreach_lerp_(local_bufs, local_grads, 1.0 - momentum)
+        local_updates = torch._foreach_lerp(local_grads, local_bufs, momentum) if nesterov else local_bufs
+
+        if world == 1:
+            packed = torch.stack([u.bfloat16() for u in local_updates], dim=0)
+            orth_shards = batched_newton_schulz_orthogonalize(packed, ns_steps, transposed=(rows > cols))
+        else:
+            pg = mesh.get_group()
+            pad = (-len(items)) % world
+            per_rank = (len(items) + pad) // world
+            bf16_list = [u.bfloat16() for u in local_updates]
+            if pad:
+                bf16_list.extend(torch.zeros((shard_rows, cols), device=device, dtype=torch.bfloat16) for _ in range(pad))
+            send = torch.stack(bf16_list, dim=0).view(world, per_rank, shard_rows, cols).contiguous()
+            recv = torch.empty_like(send)
+            dist.all_to_all_single(recv, send, group=pg)
+            owned = recv.permute(1, 0, 2, 3).contiguous().view(per_rank, rows, cols)
+            orth_owned = batched_newton_schulz_orthogonalize(owned, ns_steps, transposed=(rows > cols))
+            send_back = orth_owned.view(per_rank, world, shard_rows, cols).permute(1, 0, 2, 3).contiguous()
+            dist.all_to_all_single(recv, send_back, group=pg)
+            orth_shards = recv.view(per_rank * world, shard_rows, cols)[: len(items)]
+
+        if weight_decay != 0.0:
+            torch._foreach_mul_(local_params, 1.0 - lr * weight_decay)
+        step_scale = -lr * self._lr_ratio(shape, adjust_lr)
+        torch._foreach_add_(local_params, [orth_shards[i].to(local_params[i].dtype) for i in range(len(items))], alpha=step_scale)
+
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]
         for group in self.param_groups:
+            lr: float = group["lr"]
+            wd: float = group["weight_decay"]
+            mom: float = group["momentum"]
+            nesterov: bool = group["nesterov"]
+            ns_steps: int = group["ns_steps"]
+            adjust_lr: str = group["adjust_lr"]
+
+            cuda_triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            fsdp_buckets: dict[tuple[torch.Size, torch.dtype], list[tuple[DTensor, DTensor, DTensor]]] = defaultdict(list)
+            fallback: list[tuple[nn.Parameter, torch.Tensor, torch.Tensor]] = []
+
             for param in group["params"]:
                 if param.grad is None:
                     continue
@@ -71,16 +171,31 @@ class Muon(torch.optim.Optimizer):
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(grad)
                 buf = state["momentum_buffer"]
-                buf.lerp_(grad, 1 - group["momentum"])
-                update = grad.lerp(buf, group["momentum"]) if group["nesterov"] else buf
+                if _can_fast_cuda_muon(param, grad, buf):
+                    cuda_triples.append((param, grad, buf))
+                elif _can_owner_sharded_fsdp_muon(param, grad) and isinstance(buf, DTensor):
+                    fsdp_buckets[(param.shape, param.dtype)].append((param, grad, buf))  # type: ignore[arg-type]
+                else:
+                    fallback.append((param, grad, buf))
+
+            if cuda_triples:
+                from ..ops.muon import muon_step_cuda
+
+                muon_step_cuda(cuda_triples, lr, wd, mom, nesterov, ns_steps, adjust_lr, self._lr_ratio)
+
+            for items in fsdp_buckets.values():
+                self._step_fsdp_bucket(items, lr, wd, mom, nesterov, ns_steps, adjust_lr)
+
+            for param, grad, buf in fallback:
+                buf.lerp_(grad, 1 - mom)
+                update = grad.lerp(buf, mom) if nesterov else buf
                 if isinstance(update, DTensor):
-                    full = newton_schulz_orthogonalize(update.full_tensor(), group["ns_steps"])
+                    full = newton_schulz_orthogonalize(update.bfloat16().full_tensor(), ns_steps)
                     update = distribute_tensor(full, update.device_mesh, update.placements, src_data_rank=None)
                 else:
-                    update = newton_schulz_orthogonalize(update, group["ns_steps"])
-                lr = group["lr"]
-                param.mul_(1 - lr * group["weight_decay"])
-                param.add_(update.to(param.dtype), alpha=-lr * self._lr_ratio(param.shape, group["adjust_lr"]))
+                    update = newton_schulz_orthogonalize(update, ns_steps)
+                param.mul_(1 - lr * wd)
+                param.add_(update.to(param.dtype), alpha=-lr * self._lr_ratio(param.shape, adjust_lr))
 
 
 @dataclass

@@ -68,32 +68,39 @@ def uses_fsdp(config: ParallelConfig, info: DistInfo) -> bool:
     return config.strategy == "fsdp"
 
 
-def convert_float8(model: MykLLM, recipe: str) -> int:
-    """Swap eligible linears for torchao's Float8Linear; returns how many were swapped.
+def convert_float8(model: MykLLM, recipe: str, *, skip_down_proj: bool = False) -> int:
+    """Swap eligible linears for FP8 / MXFP8 training modules; returns swapped count.
 
     Skipped: the output head (it shares the embedding table and the fused loss reads its
-    weight directly), linears inside Gated DeltaNet layers (they run outside
-    torch.compile, where the unfused FP8 casts cost about what the matmuls save), and
-    linears with a dimension not divisible by 16 (an FP8 matmul requirement).
+    weight directly), narrow recurrent decay / step-size projections inside DeltaNet and
+    Kimi Delta Attention (KDA) (`a_proj`, `b_proj`, `f_proj`), optionally SwiGLU
+    `down_proj`, and linears failing alignment (16 for 8-bit Floating Point (FP8), 32 for
+    Microscaling FP8 (MXFP8)).
     """
+    align = 32 if recipe == "mxfp8" else 16
+
+    def eligible(module: nn.Module, fqn: str) -> bool:
+        return (
+            type(module) is nn.Linear
+            and fqn != "lm_head"
+            and not fqn.endswith((".a_proj", ".b_proj"))
+            and ".f_proj." not in fqn
+            and not (skip_down_proj and fqn.endswith(".down_proj"))
+            and module.in_features % align == 0
+            and module.out_features % align == 0
+        )
+
+    if recipe == "mxfp8":
+        from ..ops.mxfp8 import convert_to_mxfp8_training
+
+        return convert_to_mxfp8_training(model, module_filter_fn=eligible)
+
     try:
         from torchao.float8 import Float8LinearConfig, convert_to_float8_training
     except ImportError as error:  # pragma: no cover - optional dependency
         raise ImportError("parallel.float8 needs torchao: pip install torchao") from error
-    from ..model.mixers import DeltaNet
 
-    eager = {id(m) for mixer in model.modules() if isinstance(mixer, DeltaNet) for m in mixer.modules()}
-
-    def eligible(module: nn.Module, fqn: str) -> bool:
-        return (
-            isinstance(module, nn.Linear)
-            and fqn != "lm_head"
-            and id(module) not in eager
-            and module.in_features % 16 == 0
-            and module.out_features % 16 == 0
-        )
-
-    before = sum(isinstance(m, nn.Linear) for m in model.modules())
+    before = sum(type(m) is nn.Linear for m in model.modules())
     convert_to_float8_training(model, config=Float8LinearConfig.from_recipe_name(recipe), module_filter_fn=eligible)
     return before - sum(type(m) is nn.Linear for m in model.modules())
 
@@ -107,9 +114,9 @@ def parallelize(model: MykLLM, config: ParallelConfig, info: DistInfo) -> MykLLM
     the objectives already normalize by the global number of supervised tokens.
     """
     if config.float8 != "none":
-        convert_float8(model, config.float8)
+        convert_float8(model, config.float8, skip_down_proj=config.float8_skip_down_proj)
     if config.activation_checkpointing:
-        model.set_activation_checkpointing(True)
+        model.set_activation_checkpointing(config.activation_checkpointing)
     if config.compile:
         model.compile_blocks()
     if not uses_fsdp(config, info):

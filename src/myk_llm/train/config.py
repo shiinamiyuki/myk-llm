@@ -104,12 +104,17 @@ class ParallelConfig:
     param_dtype: Literal["fp32", "bf16"] = "fp32"
     reshard_after_forward: bool = True  # False trades memory for less all-gather traffic
     compile: bool = True
-    activation_checkpointing: bool = False
-    # FP8 (8-bit floating point) matmuls in the block linears via torchao's Float8Linear,
-    # with dynamic scaling; master weights, optimizer and output head are unchanged.
-    # A torchao recipe name; "tensorwise" is the fast one (see notes/fp8.md). The
-    # rowwise recipes fail under autocast with fp32 parameters in torchao 0.9.
-    float8: Literal["none", "tensorwise", "rowwise", "rowwise_with_gw_hp"] = "none"
+    # False / 0: off; True / 1: every block; k > 1: every k-th block (selective).
+    activation_checkpointing: bool | int = False
+    # 8-bit Floating Point (FP8) matmuls in the block linears with dynamic scaling;
+    # master weights, optimizer and output head are unchanged. "mxfp8" uses 32-element
+    # Open Compute Project (OCP) Microscaling FP8 (MXFP8) block scaling on Blackwell
+    # Graphics Processing Units (GPUs) for outlier robustness at near-tensorwise speed.
+    float8: Literal["none", "tensorwise", "rowwise", "rowwise_with_gw_hp", "mxfp8"] = "none"
+    # Keep Feed-Forward Network (FFN) `down_proj` in high precision under FP8 (useful
+    # with `tensorwise` on non-Blackwell GPUs where SwiGLU `silu(gate) * up` squares
+    # activation outliers).
+    float8_skip_down_proj: bool = False
 
 
 @dataclass
