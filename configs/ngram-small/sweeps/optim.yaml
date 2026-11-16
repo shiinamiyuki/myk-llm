@@ -1,0 +1,28 @@
+# Optimizer of the n-gram tables (notes/ngram-tables.md), 32K vocabulary, 2 x 1M rows x 128
+# at block 1 (the v32k-b1m run of tables.yaml). dense = AdamW over every row every step
+# (the default); lazy = Adam on the rows the step looks up only, which is what host
+# offload needs (train/ngram_tables.py). lr = 5e-4 x lr_scale; wd = optimizer.ngram.weight_decay.
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/optim.yaml
+name: ngram-optim
+configs:
+  v32k: configs/ngram-small/v32k.yaml
+overrides: ["model.ngram.orders=[2,3]", model.ngram.dim=128, "model.ngram.layers=[1]", model.ngram.num_buckets=1048576,
+            logging.tensorboard=false]
+axes:
+  opt:
+    dense: [optimizer.ngram.update=dense]
+    dense-wd: [optimizer.ngram.update=dense, optimizer.ngram.weight_decay=0.1]
+    dense-lr5x: [optimizer.ngram.update=dense, optimizer.ngram.lr_scale=5]
+    lazy: [optimizer.ngram.update=lazy]
+    lazy-lr5x: [optimizer.ngram.update=lazy, optimizer.ngram.lr_scale=5]
+    # catch_up: rows skipped for k steps first get dense AdamW's k zero-gradient updates
+    lazy-catchup-lr5x: [optimizer.ngram.update=lazy, optimizer.ngram.catch_up=true, optimizer.ngram.lr_scale=5]
+    lazy-catchup: [optimizer.ngram.update=lazy, optimizer.ngram.catch_up=true]
+    dense-lr15x: [optimizer.ngram.update=dense, optimizer.ngram.lr_scale=15]
+    lazy-lr15x: [optimizer.ngram.update=lazy, optimizer.ngram.lr_scale=15]
+    # rowwise second moment: optimizer state 4 + ~0 instead of 8 bytes per parameter
+    lazy-catchup-lr5x-rowwise: [optimizer.ngram.update=lazy, optimizer.ngram.catch_up=true, optimizer.ngram.lr_scale=5,
+                                optimizer.ngram.second_moment=rowwise]
+    # Strong weight decay: lr x wd x steps ~ 8, the decay a never-seen row gets over the run
+    # (~0.15 at wd 0.1 here; hundreds in a production run)
+    dense-lr5x-wd1: [optimizer.ngram.update=dense, optimizer.ngram.lr_scale=5, optimizer.ngram.weight_decay=1.0]

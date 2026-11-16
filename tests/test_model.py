@@ -360,3 +360,42 @@ def test_cross_decoder_does_not_feed_the_shared_kv():
         model.layers[2].ffn.down_proj.weight.mul_(5)
         after = model(ids, use_cache=True).cache[2]
     torch.testing.assert_close(before.keys, after.keys, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", ["gdn", "kda"])
+def test_compiled_selective_checkpointing_matches_eager_across_dynamic_varlen(kind):
+    """Compiled blocks + selective activation checkpointing match eager gradients even as
+    packed document counts vary across steps."""
+    from myk_llm.data import Batch
+    from myk_llm.train.config import ObjectiveConfig, ParallelConfig
+    from myk_llm.train.distributed import DistInfo, parallelize
+    from myk_llm.train.objectives import Objective
+
+    eager = build(layer_pattern="DDDG", **{"deltanet.kind": kind}).train()
+    compiled = parallelize(
+        build(layer_pattern="DDDG", **{"deltanet.kind": kind}).train(),
+        ParallelConfig(strategy="none", compile=True, activation_checkpointing=2),
+        DistInfo(0, 1, 0, torch.device("cuda")),
+    )
+    compiled.load_state_dict(eager.state_dict())
+    assert [b.activation_checkpointing for b in compiled.blocks] == [True, False, True, False]
+
+    objective = Objective(ObjectiveConfig(), torch.device("cuda"))
+    doc_splits = [
+        [torch.tensor([64, 64]), torch.tensor([128])],
+        [torch.tensor([32, 32, 64]), torch.tensor([40, 48, 40])],
+    ]
+    for split in doc_splits:
+        ids = torch.randint(0, 500, (2, 129), device="cuda")
+        batch = Batch(ids[:, :-1], ids[:, 1:], split)
+        for m in (eager, compiled):
+            m.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss_ref = eager(batch.input_ids, seqlens=batch.seqlens, head=objective.head(batch, float(batch.num_targets))).loss
+            loss_cmp = compiled(batch.input_ids, seqlens=batch.seqlens, head=objective.head(batch, float(batch.num_targets))).loss
+        loss_ref.backward()
+        loss_cmp.backward()
+        torch.testing.assert_close(loss_cmp.detach(), loss_ref.detach(), rtol=2e-3, atol=2e-3)
+        for (name, p_ref), (_, p_cmp) in zip(eager.named_parameters(), compiled.named_parameters()):
+            cos = F.cosine_similarity(p_ref.grad.float().flatten(), p_cmp.grad.float().flatten(), dim=0)
+            assert float(cos) > 0.995, name

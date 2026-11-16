@@ -10,6 +10,33 @@ from ..model.config import ModelConfig
 
 
 @dataclass
+class NgramOptimConfig:
+    """Optimizer for the hashed n-gram tables (model.ngram); see train/ngram_tables.py.
+
+    dense: the tables are ordinary parameters in the AdamW optimizer, so every row gets
+           a gradient (mostly zeros) and an update every step, and weight decay shrinks
+           every row every step.
+    lazy:  only the rows the step looks up are gathered, updated (Adam) and written
+           back; the moments of the other rows stay frozen (LazyAdam). The rows live on
+           the GPU (`placement: gpu`) or in host memory (`placement: host`), where the
+           next step's rows are gathered and copied while the current step computes.
+           With `catch_up`, a row gathered again after k skipped steps first gets the k
+           zero-gradient updates dense AdamW would have made (momentum drift, moment
+           decay, weight decay) in closed form, so lazy tracks dense.
+    """
+
+    update: Literal["dense", "lazy"] = "dense"
+    placement: Literal["gpu", "host"] = "gpu"  # lazy only
+    prefetch: bool = True  # host: gather the next step's rows during the current step
+    lr_scale: float = 1.0  # table learning rate = optimizer.lr x lr_scale
+    weight_decay: float = 0.0
+    # rowwise: one second-moment value per row (the mean of g^2 over the row) instead of
+    # one per element, halving the optimizer state (FBGEMM's "partial rowwise Adam").
+    second_moment: Literal["elementwise", "rowwise"] = "elementwise"
+    catch_up: bool = False  # lazy only
+
+
+@dataclass
 class OptimizerConfig:
     name: Literal["muon", "adamw"] = "muon"
     lr: float = 3e-4  # AdamW parameters (embeddings, norms; everything when name=adamw)
@@ -23,6 +50,7 @@ class OptimizerConfig:
     muon_ns_steps: int = 5
     muon_adjust_lr: Literal["original", "match_rms_adamw", "none"] = "match_rms_adamw"
     grad_clip: float = 1.0  # max global gradient norm; 0 disables
+    ngram: NgramOptimConfig = field(default_factory=NgramOptimConfig)
 
 
 @dataclass
@@ -76,17 +104,23 @@ class ParallelConfig:
     param_dtype: Literal["fp32", "bf16"] = "fp32"
     reshard_after_forward: bool = True  # False trades memory for less all-gather traffic
     compile: bool = True
-    activation_checkpointing: bool = False
-    # FP8 (8-bit floating point) matmuls in the block linears via torchao's Float8Linear,
-    # with dynamic scaling; master weights, optimizer and output head are unchanged.
-    # A torchao recipe name; "tensorwise" is the fast one (see notes/fp8.md). The
-    # rowwise recipes fail under autocast with fp32 parameters in torchao 0.9.
-    float8: Literal["none", "tensorwise", "rowwise", "rowwise_with_gw_hp"] = "none"
+    # False / 0: off; True / 1: every block; k > 1: every k-th block (selective).
+    activation_checkpointing: bool | int = False
+    # 8-bit Floating Point (FP8) matmuls in the block linears with dynamic scaling;
+    # master weights, optimizer and output head are unchanged. "mxfp8" uses 32-element
+    # Open Compute Project (OCP) Microscaling FP8 (MXFP8) block scaling on Blackwell
+    # Graphics Processing Units (GPUs) for outlier robustness at near-tensorwise speed.
+    float8: Literal["none", "tensorwise", "rowwise", "rowwise_with_gw_hp", "mxfp8"] = "none"
+    # Keep Feed-Forward Network (FFN) `down_proj` in high precision under FP8 (useful
+    # with `tensorwise` on non-Blackwell GPUs where SwiGLU `silu(gate) * up` squares
+    # activation outliers).
+    float8_skip_down_proj: bool = False
 
 
 @dataclass
 class CheckpointConfig:
     interval: int = 500  # steps; 0 disables periodic checkpoints (the final one is still saved)
+    final: bool = True  # save a checkpoint at the last step (off: e.g. sweeps with huge n-gram tables)
     keep_last: int = 3  # rolling checkpoints to keep (0 keeps all)
     keep_every: int = 0  # additionally keep every N-th step forever (0 disables)
     export_weights: bool = True  # also write model.safetensors (for eval/chat) with each checkpoint

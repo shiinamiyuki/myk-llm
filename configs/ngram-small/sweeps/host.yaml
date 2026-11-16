@@ -1,0 +1,23 @@
+# N-gram tables larger than GPU memory (notes/ngram-tables.md), 32K vocabulary, 2 orders x
+# dim 128 at block 1, table lr 15x (the best dense and lazy setting in optim.yaml). Dense
+# AdamW tops out near 2 x 4M rows on the 32 GB card (27.8 GB peak); host offload keeps
+# weights + Adam moments in host RAM:
+#   2 x 16M rows: 4.3B parameters, 51.5 GB (fp32 weight + 2 moments)
+#   2 x 32M rows: 8.6B parameters, 69 GB with the rowwise second moment
+# No final checkpoint (it would hold the whole table).
+#   python scripts/sweep_train.py configs/ngram-small/sweeps/host.yaml
+name: ngram-host
+configs:
+  v32k: configs/ngram-small/v32k.yaml
+overrides: ["model.ngram.orders=[2,3]", model.ngram.dim=128, "model.ngram.layers=[1]", optimizer.ngram.lr_scale=15,
+            checkpoint.final=false, logging.tensorboard=false]
+axes:
+  table:
+    b1m-gpu: [model.ngram.num_buckets=1048576, optimizer.ngram.update=lazy, optimizer.ngram.catch_up=true]
+    b4m-dense: [model.ngram.num_buckets=4194304, optimizer.ngram.update=dense]
+    b4m-host: [model.ngram.num_buckets=4194304, optimizer.ngram.update=lazy, optimizer.ngram.catch_up=true,
+               optimizer.ngram.placement=host]
+    b16m-host: [model.ngram.num_buckets=16777216, optimizer.ngram.update=lazy, optimizer.ngram.catch_up=true,
+                optimizer.ngram.placement=host]
+    b32m-host-rowwise: [model.ngram.num_buckets=33554432, optimizer.ngram.update=lazy, optimizer.ngram.catch_up=true,
+                        optimizer.ngram.placement=host, optimizer.ngram.second_moment=rowwise]

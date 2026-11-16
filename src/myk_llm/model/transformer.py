@@ -83,10 +83,13 @@ class Block(nn.Module):
         state: Any = None,
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, Any]:
+        step = self.__dict__.get("_compiled_forward") or Block._forward
         if self.activation_checkpointing and torch.is_grad_enabled() and not use_cache:
             # `state` is None here except for a cross-decoder block (the shared KV).
-            return checkpoint(self._forward, x, position_ids, varlen, state, False, use_reentrant=False)
-        return self._forward(x, position_ids, varlen, state, use_cache)
+            # Keep `checkpoint` outside the compiled `_forward` so graph breaks inside
+            # a mixer do not force the block back to eager execution.
+            return checkpoint(step, self, x, position_ids, varlen, state, False, use_reentrant=False)
+        return step(self, x, position_ids, varlen, state, use_cache)
 
     def _forward(
         self, x: torch.Tensor, position_ids: torch.Tensor, varlen: Varlen | None, state: Any, use_cache: bool
@@ -173,10 +176,13 @@ class ModelOutput:
 
 def build_varlen(seqlens: list[torch.Tensor], batch: int, seq_len: int, device: torch.device) -> Varlen:
     """Block-diagonal layout from per-sample document lengths (each sums to seq_len)."""
-    lengths = torch.cat([s.to(device=device, dtype=torch.int32) for s in seqlens])
-    cu_seqlens = F.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
+    lengths_cpu = torch.cat([s.to(device="cpu", dtype=torch.int32) for s in seqlens])
+    cu_seqlens_cpu = F.pad(lengths_cpu.cumsum(0, dtype=torch.int32), (1, 0))
+    cu_seqlens = cu_seqlens_cpu.to(device=device, non_blocking=True)
+    torch._dynamo.mark_dynamic(cu_seqlens, 0)
+    torch._dynamo.mark_dynamic(cu_seqlens_cpu, 0)
     # A constant upper bound (not the data-dependent max) avoids recompiles.
-    return Varlen(cu_seqlens=cu_seqlens, max_seqlen=seq_len)
+    return Varlen(cu_seqlens=cu_seqlens, max_seqlen=seq_len, cu_seqlens_cpu=cu_seqlens_cpu)
 
 
 class MykLLM(nn.Module):
@@ -242,16 +248,22 @@ class MykLLM(nn.Module):
         return [*self.layers, *(m.block for m in self.mtp)]
 
     def compile_blocks(self, **kwargs: Any) -> None:
-        """torch.compile each block in place (parameter names are unchanged)."""
-        # All blocks share Block.forward, so every (layer type, grad mode, shape) variant
-        # is one more compiled entry of the same code; past the limit, blocks run eagerly.
-        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 16)
+        """torch.compile each block's step in place (parameter names are unchanged)."""
+        # All blocks share one compiled `Block._forward` so TorchDynamo does not guard on
+        # block identity; raise the limit for (layer type, grad mode, shape) variants.
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 32)
+        compiled = torch.compile(Block._forward, **kwargs)
         for block in self.blocks:
-            block.compile(**kwargs)
+            block.__dict__["_compiled_forward"] = compiled
 
-    def set_activation_checkpointing(self, enabled: bool) -> None:
-        for block in self.blocks:
-            block.activation_checkpointing = enabled
+    def set_activation_checkpointing(self, enabled: bool | int) -> None:
+        """Enable gradient checkpointing: False / 0 = off, True / 1 = every block,
+        stride k > 1 = every k-th block (selective checkpointing)."""
+        stride = (1 if enabled else 0) if isinstance(enabled, bool) else int(enabled)
+        if stride < 0:
+            raise ValueError(f"activation_checkpointing must be a bool or >= 0, got {enabled!r}")
+        for i, block in enumerate(self.blocks):
+            block.activation_checkpointing = bool(stride and i % stride == 0)
 
     # -- forward ----------------------------------------------------------------------
     def forward(

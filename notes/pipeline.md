@@ -72,6 +72,11 @@ NNODES=2 MASTER_ADDR=node0 scripts/launch.sh configs/pretrain/200m.yaml   # on e
   [fp8.md](fp8.md).
 - **Muon** works on sharded parameters (momentum per shard, orthogonalization on the
   gathered matrix; every rank does all matrices, which is fine up to ~1B params).
+- **N-gram tables** (`model.ngram`) get their own Adam settings under `optimizer.ngram`
+  (`lr_scale`, `weight_decay`). `update: lazy` (single GPU) updates only the rows a step
+  looks up, `catch_up: true` makes that track dense AdamW, and `placement: host` keeps the
+  tables and their Adam state in host RAM with prefetch, for tables larger than the GPU.
+  See [ngram-tables.md](ngram-tables.md).
 - **Resume:** re-run the same command; it continues from the newest complete checkpoint
   in `runs/<run_name>/checkpoints/` (model, optimizer, data position). `--resume none`
   starts over, `--resume <dir>` picks a specific checkpoint. Checkpoints use

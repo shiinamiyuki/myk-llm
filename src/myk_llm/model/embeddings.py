@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 import torch.nn as nn
 
@@ -41,6 +43,10 @@ class NgramEmbedding(nn.Module):
         self.projs = nn.ModuleList(
             nn.Linear(config.dim, hidden_size, bias=False) if needs_proj else nn.Identity() for _ in self.layers
         )
+        # Optional replacement for the tables: maps row ids (orders, batch, seq_len) to the
+        # summed rows (batch, seq_len, dim). Set by training with sparse n-gram updates
+        # (myk_llm.train.ngram_tables), which keeps the rows outside the module.
+        self.row_source: Callable[[torch.Tensor], torch.Tensor] | None = None
 
     @property
     def context(self) -> int:
@@ -51,18 +57,26 @@ class NgramEmbedding(nn.Module):
         features = self.lookup(input_ids, prefix_ids)
         return {layer: proj(features) for layer, proj in zip(self.layers, self.projs)}
 
-    def lookup(self, input_ids: torch.Tensor, prefix_ids: torch.Tensor | None) -> torch.Tensor:
-        """Summed table rows, (batch, seq_len, dim)."""
+    def row_ids(self, input_ids: torch.Tensor, prefix_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """(orders, batch, seq_len) ids into the tables stacked in order: row b of
+        table k is row k * num_buckets + b. Works on CPU and GPU tensors alike."""
         batch, context = input_ids.size(0), self.context
         left = torch.full((batch, context), self.sentinel, dtype=input_ids.dtype, device=input_ids.device)
         if prefix_ids is not None and prefix_ids.size(1) > 0:
             tail = prefix_ids[:, -context:]
             left[:, context - tail.size(1) :] = tail
         tokens = torch.cat([left, input_ids], dim=1)
-        return sum(
-            table(ngram_bucket_ids(tokens, order, context, self.num_buckets))
-            for order, table in zip(self.orders, self.tables)
-        )
+        return torch.stack([
+            ngram_bucket_ids(tokens, order, context, self.num_buckets) + k * self.num_buckets
+            for k, order in enumerate(self.orders)
+        ])
+
+    def lookup(self, input_ids: torch.Tensor, prefix_ids: torch.Tensor | None) -> torch.Tensor:
+        """Summed table rows, (batch, seq_len, dim)."""
+        ids = self.row_ids(input_ids, prefix_ids)
+        if self.row_source is not None:
+            return self.row_source(ids)
+        return sum(table(ids[k] - k * self.num_buckets) for k, table in enumerate(self.tables))
 
 
 class Embeddings(nn.Module):

@@ -26,6 +26,7 @@ from ..model import MykLLM, generate, load_model
 from .checkpoint import latest_checkpoint, load_checkpoint, prune_checkpoints, save_checkpoint, step_dir
 from .config import InitConfig, TrainConfig
 from .distributed import DistInfo, all_reduce_sum, init_distributed, parallelize, shutdown
+from .ngram_tables import SparseNgramTables
 from .optim import build_optimizers, lr_multiplier, set_lr
 
 
@@ -80,6 +81,20 @@ def initialize_weights(model: MykLLM, config: InitConfig) -> None:
             model.embed.token.weight.copy_(weight)
     if config.freeze_embedding:
         model.embed.token.weight.requires_grad_(False)
+
+
+def build_sparse_tables(model: MykLLM, config: TrainConfig, info: DistInfo, tokens_per_step: int) -> SparseNgramTables | None:
+    """Lazy-Adam n-gram tables (optimizer.ngram.update=lazy), taken off the CPU model."""
+    ngram = config.optimizer.ngram
+    if ngram.update != "lazy" or model.embed.ngram is None:
+        return None
+    if info.enabled:
+        raise NotImplementedError("optimizer.ngram.update=lazy is single-GPU only")
+    module = model.embed.ngram
+    return SparseNgramTables(
+        module, ngram, config.optimizer.lr, tuple(config.optimizer.betas), config.optimizer.eps, info.device,
+        max_rows_per_step=tokens_per_step * len(module.orders),
+    )
 
 
 # -- evaluation ------------------------------------------------------------------------
@@ -161,9 +176,14 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
     grad_accum = config.global_batch_size // per_step
     tokens_per_step = config.global_batch_size * config.data.seq_len
 
-    model = MykLLM(config.model).to(info.device)
+    model = MykLLM(config.model)
     initialize_weights(model, config.init)
+    tables = build_sparse_tables(model, config, info, tokens_per_step)  # takes the n-gram tables off the model
+    model = model.to(info.device)
     log0(info, f"model: {model.num_parameters() / 1e6:.1f}M params ({model.num_parameters(exclude_embeddings=True) / 1e6:.1f}M non-embedding), layers {config.model.layout}")
+    if tables is not None:
+        log0(info, f"n-gram tables: {tables.num_parameters() / 1e6:.1f}M params, lazy Adam on {config.optimizer.ngram.placement} "
+                   f"({tables.state_bytes() / 2**30:.1f}GB weights + moments)")
     model = parallelize(model, config.parallel, info)
     optimizers = build_optimizers(model, config.optimizer)
     base_lrs = [[g["lr"] for g in opt.param_groups] for opt in optimizers]
@@ -179,6 +199,8 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
     checkpoint = latest_checkpoint(run_dir) if resume == "auto" else (Path(resume) if resume != "none" else None)
     if checkpoint is not None:
         trainer_state, data_state = load_checkpoint(checkpoint, model, optimizers, info)
+        if tables is not None:
+            tables.load(checkpoint)
         start_step, tokens_seen = trainer_state["step"] + 1, trainer_state["tokens"]
         if data_state is not None:
             loader.load_state_dict(data_state)
@@ -187,6 +209,8 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
         log0(info, f"resumed from {checkpoint} at step {start_step}")
     elif config.init.checkpoint_from:
         load_checkpoint(Path(config.init.checkpoint_from), model, optimizers if config.init.load_optimizer else None, info)
+        if tables is not None:
+            tables.load(Path(config.init.checkpoint_from), load_optimizer=config.init.load_optimizer)
         log0(info, f"warm start from {config.init.checkpoint_from} (optimizer {'carried' if config.init.load_optimizer else 'fresh'})")
 
     val_sets = {
@@ -220,9 +244,30 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
             metrics.log(step, record)
         log0(info, f"step {step:6d} [val] " + " ".join(f"{k}={v:.4f}" for k, v in record.items()))
 
+    def is_checkpoint_step(step: int) -> bool:
+        if step == config.steps:
+            return config.checkpoint.final
+        return bool(config.checkpoint.interval and step % config.checkpoint.interval == 0)
+
+    def draw(step: int) -> tuple[list, dict[str, Any] | None]:
+        """The micro-batches of `step`, and the loader state after them if that step
+        saves a checkpoint (the loader may already be ahead by then: lookahead)."""
+        batches = [next(data_iter) for _ in range(grad_accum)]
+        return batches, loader.state_dict() if is_checkpoint_step(step) else None
+
+    lookahead = tables is not None and tables.prefetch  # host tables gather the next step's rows early
+    upcoming = draw(start_step) if start_step <= config.steps else None
     for step in range(start_step, config.steps + 1):
-        set_lr(optimizers, base_lrs, lr_multiplier(step, config.steps, config.schedule))
-        micro_batches = [next(data_iter) for _ in range(grad_accum)]
+        multiplier = lr_multiplier(step, config.steps, config.schedule)
+        set_lr(optimizers, base_lrs, multiplier)
+        if upcoming is None:
+            upcoming = draw(step)
+        (micro_batches, data_state), upcoming = upcoming, None
+        if lookahead and step < config.steps:
+            upcoming = draw(step + 1)
+        if tables is not None:
+            tables.set_lr_multiplier(multiplier)
+            tables.begin_step([b.input_ids for b in micro_batches], [b.input_ids for b in upcoming[0]] if upcoming else None)
         normalizer = all_reduce_sum(sum(b.num_targets for b in micro_batches), info.device)
         for batch in micro_batches:
             batch = batch.to(info.device)
@@ -231,12 +276,15 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
             out.loss.backward()
             for key, value in out.sums.items():
                 sums[key] = sums.get(key, 0.0) + float(value)
-        grad_norm = torch.nn.utils.clip_grad_norm_(params, config.optimizer.grad_clip or float("inf"))
+        clipped = params + tables.parameters() if tables is not None else params
+        grad_norm = torch.nn.utils.clip_grad_norm_(clipped, config.optimizer.grad_clip or float("inf"))
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
         for optimizer in optimizers:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+        if tables is not None:
+            tables.step()
         tokens_seen += tokens_per_step
         window_tokens += tokens_per_step
         step_tokens_total += normalizer
@@ -254,6 +302,8 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
                 "perf/peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30,
                 "tokens": tokens_seen,
             })
+            if tables is not None:
+                record.update(tables.pop_stats())
             if metrics is not None:
                 metrics.log(step, record)
             log0(info, f"step {step:6d} loss {record['train/loss']:.4f} lr {record['train/lr']:.2e} "
@@ -268,12 +318,17 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
             for text in sample_text(model, tokenizer, config, info):
                 log0(info, f"--- sample ---\n{text}")
 
-        if step == config.steps or (config.checkpoint.interval and step % config.checkpoint.interval == 0):
+        if is_checkpoint_step(step):
             target = step_dir(run_dir, step)
             trainer_state = {"step": step, "tokens": tokens_seen, "world_size": info.world_size}
+            extra_weights = None
+            if tables is not None:
+                target.mkdir(parents=True, exist_ok=True)
+                tables.save(target)
+                extra_weights = tables.export_weights() if config.checkpoint.export_weights else None
             save_checkpoint(
-                target, model, optimizers, trainer_state, loader.state_dict(), info,
-                config.checkpoint.export_weights, config.data.tokenizer,
+                target, model, optimizers, trainer_state, data_state, info,
+                config.checkpoint.export_weights, config.data.tokenizer, extra_weights,
             )
             if info.is_main:
                 prune_checkpoints(run_dir, config.checkpoint.keep_last, config.checkpoint.keep_every)
@@ -283,6 +338,8 @@ def train(config: TrainConfig, resume: str = "auto") -> None:
         run_validation(config.steps)
     if metrics is not None:
         metrics.close()
+    if tables is not None:
+        tables.close()
     loader.close()
     shutdown()
 

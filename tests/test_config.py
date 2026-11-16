@@ -36,8 +36,13 @@ def test_sweeps_expand(testbed):
 
 
 def test_overrides_are_typed():
-    config = load_config(TrainConfig, None, ["optimizer.lr=3e-4", "model.ngram.orders=[2, 3]", "data.document_masking=false"])
+    config = load_config(
+        TrainConfig,
+        None,
+        ["optimizer.lr=3e-4", "model.ngram.orders=[2, 3]", "data.document_masking=false", "parallel.activation_checkpointing=2"],
+    )
     assert config.optimizer.lr == 3e-4 and config.model.ngram.orders == [2, 3] and not config.data.document_masking
+    assert config.parallel.activation_checkpointing == 2 and type(config.parallel.activation_checkpointing) is int
 
 
 def test_unknown_key_is_an_error():

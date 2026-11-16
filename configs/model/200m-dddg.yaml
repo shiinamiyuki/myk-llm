@@ -1,0 +1,19 @@
+# ~205M parameters (~138M non-embedding): 8 layers (2x DDDG), hidden 1024 (matches Qwen's
+# embedding width for warm-starting), tied 64K vocabulary. Three Gated DeltaNet linear
+# attention layers per global softmax attention layer, with no positional encoding (NoPE)
+# on global layers (see notes/lc-retrieval.md).
+model:
+  vocab_size: 65536
+  hidden_size: 1024
+  num_layers: 8
+  layer_pattern: DDDG
+  max_seq_len: 8192
+  attention:
+    num_heads: 8
+    num_kv_heads: 2
+    head_dim: 128
+    global_rope: none
+  deltanet:
+    num_heads: 8
+    head_dim: 128
+    expand_v: 1.0

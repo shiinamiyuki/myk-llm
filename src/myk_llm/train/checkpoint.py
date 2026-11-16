@@ -53,21 +53,28 @@ def save_checkpoint(
     info: DistInfo,
     export_weights: bool,
     tokenizer: str | None = None,
+    extra_weights: dict[str, torch.Tensor] | None = None,
 ) -> None:
+    """`extra_weights` replace entries of the exported model state (e.g. n-gram tables
+    kept outside the model by lazy training)."""
     directory.mkdir(parents=True, exist_ok=True)
     dcp.save(_app_state(model, optimizers), checkpoint_id=str(directory))
     torch.save(data_state, directory / f"data_rank{info.rank}.pt")
     if export_weights:
-        export_model(directory, model, info, tokenizer)
+        export_model(directory, model, info, tokenizer, extra_weights)
     barrier()
     if info.is_main:  # written last: its presence marks the checkpoint complete
         (directory / "trainer.json").write_text(json.dumps(trainer_state, indent=2), encoding="utf-8")
     barrier()
 
 
-def export_model(directory: Path, model: MykLLM, info: DistInfo, tokenizer: str | None = None) -> None:
+def export_model(
+    directory: Path, model: MykLLM, info: DistInfo, tokenizer: str | None = None,
+    extra_weights: dict[str, torch.Tensor] | None = None,
+) -> None:
     """Gather full weights on rank 0 and write a portable model directory."""
     state = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+    state.update(extra_weights or {})
     if info.is_main:
         save_model(directory, model.config, state, tokenizer)
 

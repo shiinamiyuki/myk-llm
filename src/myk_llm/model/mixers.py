@@ -32,6 +32,9 @@ class Varlen:
 
     cu_seqlens: torch.Tensor  # int32, (num_docs + 1,)
     max_seqlen: int
+    # Optional Central Processing Unit (CPU) copy of `cu_seqlens` so linear-attention
+    # chunk indexing does not synchronize the accelerator stream.
+    cu_seqlens_cpu: torch.Tensor | None = None
 
 
 @dataclass
@@ -214,6 +217,103 @@ class _FlaLayerState:
         self.state = {"recurrent_state": recurrent_state, "conv_state": conv_state}
 
 
+@torch.compiler.disable
+def _deltanet_kernels(
+    inner: nn.Module,
+    kind: str,
+    qkv: torch.Tensor,
+    decay: torch.Tensor,
+    beta: torch.Tensor,
+    gate: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_cpu: torch.Tensor | None,
+) -> torch.Tensor:
+    """Hand-written Triton kernels of Gated DeltaNet (GDN) and Kimi Delta Attention (KDA):
+    fused causal depthwise convolution, chunk / recurrent delta rule, and gated norm.
+
+    Keeping only these custom kernels under `compiler.disable` lets `torch.compile` fuse
+    the surrounding norms, casts and (optional 8-bit floating point (FP8)) projections.
+    """
+    from fla.modules.causal_conv1d import causal_conv1d
+
+    key_dim, val_dim = inner.key_dim, inner.value_dim
+    if inner.use_short_conv:
+        same_triton_conv = (
+            inner.q_conv1d.backend == inner.k_conv1d.backend == inner.v_conv1d.backend == "triton"
+            and inner.q_conv1d.activation == inner.k_conv1d.activation == inner.v_conv1d.activation
+            and inner.q_conv1d.kernel_size == inner.k_conv1d.kernel_size == inner.v_conv1d.kernel_size
+        )
+        if same_triton_conv:
+            qkv_w = torch.cat(
+                (inner.q_conv1d.weight.squeeze(1), inner.k_conv1d.weight.squeeze(1), inner.v_conv1d.weight.squeeze(1)),
+                dim=0,
+            )
+            qkv_b = (
+                torch.cat((inner.q_conv1d.bias, inner.k_conv1d.bias, inner.v_conv1d.bias), dim=0)
+                if inner.conv_bias
+                else None
+            )
+            qkv, _ = causal_conv1d(
+                x=qkv,
+                weight=qkv_w,
+                bias=qkv_b,
+                activation=inner.q_conv1d.activation,
+                backend="triton",
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+            )
+            q, k, v = qkv.split((key_dim, key_dim, val_dim), dim=-1)
+        else:
+            q, k, v = qkv.split((key_dim, key_dim, val_dim), dim=-1)
+            q, _ = inner.q_conv1d(x=q, cu_seqlens=cu_seqlens)
+            k, _ = inner.k_conv1d(x=k, cu_seqlens=cu_seqlens)
+            v, _ = inner.v_conv1d(x=v, cu_seqlens=cu_seqlens)
+    else:
+        q, k, v = torch.nn.functional.silu(qkv).split((key_dim, key_dim, val_dim), dim=-1)
+
+    bsz, seqlen = q.shape[:2]
+    q = q.view(bsz, seqlen, inner.num_heads, inner.head_k_dim)
+    k = k.view(bsz, seqlen, inner.num_heads, inner.head_k_dim)
+    v = v.view(bsz, seqlen, inner.num_v_heads, inner.head_v_dim)
+    recurrent = not torch.is_grad_enabled() and not inner.training and seqlen <= 64 and cu_seqlens is None
+
+    if kind == "kda":
+        from fla.ops.kda import chunk_kda, fused_recurrent_kda
+
+        decay = decay.view(bsz, seqlen, inner.num_v_heads, inner.head_k_dim)
+        if recurrent:
+            o, _ = fused_recurrent_kda(
+                q=q, k=k, v=v, g=decay, beta=beta, A_log=inner.A_log, dt_bias=inner.dt_bias,
+                use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, use_beta_sigmoid_in_kernel=True,
+                allow_neg_eigval=inner.allow_neg_eigval, lower_bound=inner.lower_bound, state_v_first=True,
+            )
+        else:
+            o, _ = chunk_kda(
+                q=q, k=k, v=v, g=decay, beta=beta, A_log=inner.A_log, dt_bias=inner.dt_bias,
+                use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, use_beta_sigmoid_in_kernel=True,
+                allow_neg_eigval=inner.allow_neg_eigval, safe_gate=inner.safe_gate, lower_bound=inner.lower_bound,
+                state_v_first=True, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
+            )
+    else:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+
+        rule = fused_recurrent_gated_delta_rule if recurrent else chunk_gated_delta_rule
+        extra = {} if recurrent else {"cu_seqlens_cpu": cu_seqlens_cpu}
+        o, _ = rule(
+            q=q, k=k, v=v, g=decay, beta=beta,
+            use_qk_l2norm_in_kernel=True, use_beta_sigmoid_in_kernel=True,
+            allow_neg_eigval=inner.allow_neg_eigval, state_v_first=True,
+            cu_seqlens=cu_seqlens, use_gate_in_kernel=True,
+            A_log=inner.A_log, dt_bias=inner.dt_bias, **extra,
+        )
+
+    if gate is not None:
+        o = inner.o_norm(o, gate.view(bsz, seqlen, inner.num_v_heads, inner.head_v_dim))
+    else:
+        o = inner.o_norm(o)
+    return o.reshape(bsz, seqlen, val_dim)
+
+
 class DeltaNet(nn.Module):
     """Gated DeltaNet linear attention (Yang et al., 2024) or Kimi Delta Attention (Kimi
     Linear, 2025; `deltanet.kind`) from flash-linear-attention."""
@@ -228,6 +328,7 @@ class DeltaNet(nn.Module):
         except ImportError as error:  # pragma: no cover - optional dependency
             raise ImportError("'D' layers need flash-linear-attention: pip install flash-linear-attention") from error
         cfg = config.deltanet
+        self.kind = cfg.kind
         common = dict(
             hidden_size=config.hidden_size,
             expand_v=cfg.expand_v,
@@ -246,9 +347,15 @@ class DeltaNet(nn.Module):
     def residual_projections(self) -> list[nn.Linear]:
         return [self.inner.o_proj]
 
-    # fla's layers are hand-written Triton kernels; tracing them into a compiled block
-    # gains nothing, and Inductor fails on the inference-mode (fused_recurrent) path.
     @torch.compiler.disable
+    def _forward_cached(
+        self, x: torch.Tensor, state: _FlaLayerState | None, use_cache: bool
+    ) -> tuple[torch.Tensor, _FlaLayerState | None]:
+        if use_cache and state is None:
+            state = _FlaLayerState()
+        out, _, _ = self.inner(x, past_key_values=state if use_cache else None, use_cache=use_cache)
+        return out, state if use_cache else None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -257,14 +364,22 @@ class DeltaNet(nn.Module):
         state: _FlaLayerState | None = None,
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, _FlaLayerState | None]:
-        if varlen is not None:
-            batch, seq_len, hidden = x.shape
-            out, _, _ = self.inner(x.reshape(1, batch * seq_len, hidden), cu_seqlens=varlen.cu_seqlens)
-            return out.reshape(batch, seq_len, hidden), None
-        if use_cache and state is None:
-            state = _FlaLayerState()
-        out, _, _ = self.inner(x, past_key_values=state if use_cache else None, use_cache=use_cache)
-        return out, state if use_cache else None
+        if use_cache or state is not None:
+            return self._forward_cached(x, state, use_cache)
+        inner = self.inner
+        batch, seq_len, hidden = x.shape
+        cu = varlen.cu_seqlens if varlen is not None else None
+        cu_cpu = varlen.cu_seqlens_cpu if varlen is not None else None
+        h = x.reshape(1, batch * seq_len, hidden) if cu is not None else x
+        if torch.is_autocast_enabled("cuda"):
+            h = h.to(torch.get_autocast_dtype("cuda"))
+        qkv = torch.cat((inner.q_proj(h), inner.k_proj(h), inner.v_proj(h)), dim=-1)
+        decay = inner.f_proj(h) if self.kind == "kda" else inner.a_proj(h)
+        beta = inner.b_proj(h)
+        gate = inner.g_proj(h) if (self.kind == "kda" or inner.use_gate) else None
+        o = _deltanet_kernels(inner, self.kind, qkv, decay, beta, gate, cu, cu_cpu)
+        out = inner.o_proj(o)
+        return (out.reshape(batch, seq_len, hidden) if cu is not None else out), None
 
 
 def build_mixer(config: ModelConfig, layer_type: str, first_global: bool) -> nn.Module:
