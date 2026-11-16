@@ -88,17 +88,22 @@ class ParameterGroups:
     muon: list[nn.Parameter]
     decay: list[nn.Parameter]
     no_decay: list[nn.Parameter]
+    ngram: list[nn.Parameter]
 
 
 def split_parameters(model: nn.Module, use_muon: bool) -> ParameterGroups:
-    """Muon: 2-D weights inside blocks. AdamW without decay: embeddings (token, n-gram)
-    and 1-D parameters (norms, gates). AdamW with decay: everything else."""
-    groups = ParameterGroups([], [], [])
+    """Muon: 2-D weights inside blocks. AdamW without decay: the token embedding and
+    1-D parameters (norms, gates). The n-gram tables: their own AdamW group
+    (optimizer.ngram). AdamW with decay: everything else."""
+    groups = ParameterGroups([], [], [], [])
     seen: set[int] = set()
     for name, param in model.named_parameters():
         if not param.requires_grad or id(param) in seen:
             continue
         seen.add(id(param))
+        if name.startswith("embed.ngram.tables."):
+            groups.ngram.append(param)
+            continue
         is_embedding = name.startswith("embed.") and "proj" not in name or name == "lm_head.weight"
         if is_embedding or param.ndim < 2:
             groups.no_decay.append(param)
@@ -127,6 +132,7 @@ def build_optimizers(model: nn.Module, config: OptimizerConfig) -> list[torch.op
     adam_groups = [
         {"params": groups.decay, "weight_decay": config.weight_decay},
         {"params": groups.no_decay, "weight_decay": 0.0},
+        {"params": groups.ngram, "weight_decay": config.ngram.weight_decay, "lr": config.lr * config.ngram.lr_scale},
     ]
     optimizers.append(
         torch.optim.AdamW(
